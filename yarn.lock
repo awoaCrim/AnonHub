@@ -54,15 +54,15 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@ai-sdk/openai@npm:^3.0.0":
-  version: 3.0.98
-  resolution: "@ai-sdk/openai@npm:3.0.98"
+"@ai-sdk/openai@npm:^4.0.122":
+  version: 4.0.122
+  resolution: "@ai-sdk/openai@npm:4.0.122"
   dependencies:
-    "@ai-sdk/provider": "npm:3.0.15"
-    "@ai-sdk/provider-utils": "npm:4.0.46"
+    "@ai-sdk/provider": "npm:4.0.39"
+    "@ai-sdk/provider-utils": "npm:5.0.83"
   peerDependencies:
     zod: ^3.25.76 || ^4.1.8
-  checksum: 10c0/b710e4422e9dc30790f10cf55d37e130ed2ec227e70ae981354d1b0de0698dc15470869632359a0777936f43b4032122a5bb10177602df8af6b0f25c8fa22e1f
+  checksum: 10c0/6fcf96c1852285fa82fcec22a712febef7fa76dd5d0cc62e04417077be3a6769a43a4ee3ace7b0c0c837e6b816eee4eed158300490bcc66635058956e7dab5e7
   languageName: node
   linkType: hard
 
@@ -80,12 +80,35 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@ai-sdk/provider-utils@npm:5.0.83":
+  version: 5.0.83
+  resolution: "@ai-sdk/provider-utils@npm:5.0.83"
+  dependencies:
+    "@ai-sdk/provider": "npm:4.0.39"
+    "@standard-schema/spec": "npm:^1.1.0"
+    "@workflow/serde": "npm:4.1.0"
+    eventsource-parser: "npm:^3.0.8"
+  peerDependencies:
+    zod: ^3.25.76 || ^4.1.8
+  checksum: 10c0/e3f3a8d2c71e0aa21156523bd79ef8ae98e2ea11a72c98bc9a69d58499de991575f2baee5e25edf935ac613460bbd540c804439d71822ea2e69c03078219a7f2
+  languageName: node
+  linkType: hard
+
 "@ai-sdk/provider@npm:3.0.15":
   version: 3.0.15
   resolution: "@ai-sdk/provider@npm:3.0.15"
   dependencies:
     json-schema: "npm:^0.4.0"
   checksum: 10c0/0a17eca818c6d821e9488188cf02789502e426eff125d9c9572c2308baead3ed2e93ad53856887b207f287e6907441da81860e31350b12a11c91a6dfd1c6f344
+  languageName: node
+  linkType: hard
+
+"@ai-sdk/provider@npm:4.0.39":
+  version: 4.0.39
+  resolution: "@ai-sdk/provider@npm:4.0.39"
+  dependencies:
+    json-schema: "npm:^0.4.0"
+  checksum: 10c0/295f1c7de00ed5308dc1729253fb20deef40659f3c2b2391d5cab43109352af5752b09ed5a52bea9de3cd96dce29c1af0b86189ccaa93edb103380ab0afb37e3
   languageName: node
   linkType: hard
 
@@ -2585,6 +2608,13 @@ __metadata:
   peerDependencies:
     vue: ^3.5.0
   checksum: 10c0/59860a10ca4831172fec33daa6f4ed10b869cc0604c6bca74d8a1fabcdb4a74fa5126694fac08d670e7c13d08f3a5d7487ae18eb299988c8e34d699cca86efaa
+  languageName: node
+  linkType: hard
+
+"@workflow/serde@npm:4.1.0":
+  version: 4.1.0
+  resolution: "@workflow/serde@npm:4.1.0"
+  checksum: 10c0/8ec68cd9448b486bc8244d1f2b33d64d4af4b0fc18d33417699ce29345b21e4359d880c5ea5d66872def4576c0cddcfa2a63282d1f4d661c455663c075595e81
   languageName: node
   linkType: hard
 
@@ -5230,7 +5260,7 @@ __metadata:
     "@ai-sdk/anthropic": "npm:^3.0.0"
     "@ai-sdk/deepseek": "npm:^2.0.0"
     "@ai-sdk/google": "npm:^3.0.0"
-    "@ai-sdk/openai": "npm:^3.0.0"
+    "@ai-sdk/openai": "npm:^4.0.122"
     "@yesimbot/agent-runtime": "workspace:^"
     "@yesimbot/foundation": "workspace:^"
     ai: "npm:^6.0.0"
