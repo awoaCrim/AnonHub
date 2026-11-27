@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AnonHub</string>
+    <string name="offline">无法连接</string>
+    <string name="retry">重试</string>
+    <string name="downloading">正在下载 %1$s</string>
+    <string name="saved">已保存到「下载」：%1$s</string>
+    <string name="save_failed">保存失败</string>
+    <string name="update_title">有新版本</string>
+    <string name="update_message">AnonHub %1$s</string>
+    <string name="update">更新</string>
+    <string name="later">稍后</string>
+    <string name="update_downloading">正在下载更新</string>
+    <string name="update_failed">更新失败</string>
+    <string name="update_allow">允许安装应用后会继续更新</string>
+</resources>

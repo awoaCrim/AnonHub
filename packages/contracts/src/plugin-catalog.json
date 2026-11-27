@@ -1,0 +1,90 @@
+{
+  "required": [
+    "database-sqlite",
+    "http",
+    "server",
+    "proxy-agent",
+    "console",
+    "config",
+    "logger",
+    "status",
+    "assets-local",
+    "yesimbot",
+    "yesimbot-console",
+    "yesimbot-model-provider",
+    "yesimbot-device-connection",
+    "adapter-onebot"
+  ],
+  "optional": [
+    {
+      "name": "yesimbot-memorizer",
+      "label": "长期记忆",
+      "description": "记住用户和群聊的长期信息"
+    },
+    {
+      "name": "yesimbot-roleplay",
+      "label": "角色扮演",
+      "description": "角色卡与人设"
+    },
+    {
+      "name": "yesimbot-workspace",
+      "label": "工作区与电脑",
+      "description": "隔离文件工作区，可选连接自己的电脑"
+    },
+    {
+      "name": "yesimbot-search-service",
+      "label": "搜索服务",
+      "description": "联网搜索与网页读取"
+    },
+    {
+      "name": "yesimbot-image-tools",
+      "label": "图片工具",
+      "description": "生成与编辑图片"
+    },
+    {
+      "name": "yesimbot-sticker-manager",
+      "label": "表情包",
+      "description": "收集并发送表情包"
+    },
+    {
+      "name": "yesimbot-schedule",
+      "label": "定时任务",
+      "description": "让机器人按计划主动执行任务"
+    },
+    {
+      "name": "yesimbot-message-debounce",
+      "label": "消息合并",
+      "description": "合并短时间内的连续消息"
+    },
+    {
+      "name": "yesimbot-usage",
+      "label": "用量统计",
+      "description": "统计模型调用和花费"
+    },
+    {
+      "name": "yesimbot-onebot-utils",
+      "label": "QQ 专属动作",
+      "description": "群管理、戳一戳等 QQ 专属动作"
+    },
+    {
+      "name": "yesimbot-mcp-client",
+      "label": "MCP 工具",
+      "description": "连接外部 MCP 工具服务器"
+    },
+    {
+      "name": "yesimbot-google",
+      "label": "Google 服务",
+      "description": "通过 Google 官方授权管理 Gmail、日历和网盘"
+    },
+    {
+      "name": "yesimbot-xiaoheihe",
+      "label": "小黑盒",
+      "description": "让它查看小黑盒的帖子；发帖和评论只按管理员的要求进行"
+    },
+    {
+      "name": "adapter-wechat-bridge",
+      "label": "微信接入",
+      "description": "扫码登录微信，消息由容器内的 agent-wechat 收发"
+    }
+  ]
+}

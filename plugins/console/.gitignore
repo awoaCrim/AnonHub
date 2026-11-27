@@ -1,0 +1,7 @@
+lib/
+dist/
+*.tsbuildinfo
+
+# Track browser source helpers while keeping generated lib output ignored.
+!web/src/lib/
+!web/src/lib/**

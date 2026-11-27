@@ -1,0 +1,48 @@
+{
+  "name": "@yesimbot/onebot",
+  "version": "0.0.1",
+  "private": true,
+  "description": "The QQ connector: OneBot 11 over the reverse WebSocket NapCat dials, for apps/server.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "napcat": [
+        "dist/napcat.d.ts"
+      ]
+    }
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    },
+    "./napcat": {
+      "types": "./dist/napcat.d.ts",
+      "require": "./dist/napcat.cjs",
+      "default": "./dist/napcat.js"
+    }
+  },
+  "scripts": {
+    "build": "pkgroll --sourcemap=inline",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@yesimbot/contracts": "workspace:^",
+    "@yesimbot/foundation": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "qface": "^1.4.1",
+    "qrcode": "1.5.4",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.5",
+    "@types/ws": "^8.18.1",
+    "vitest": "^4.0.18",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,82 @@
+name: yesimbot-single
+# One account as four containers on one network (leave-koishi 6.7): `net` only holds the network and the published
+# port; the app, NapCat (the unmodified upstream image) and agent-wechat join it and reach each other on 127.0.0.1.
+# Rebuilding the app recreates only the app: `net` and `wechat` run the wechat image, which changes with the daemon.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+services:
+  net:
+    image: yesimbot-wechat:local
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: wechat
+    entrypoint: ["/usr/bin/tini", "--", "sleep", "infinity"]
+    restart: unless-stopped
+    ports:
+      - "${YESIMBOT_BIND:-127.0.0.1}:${YESIMBOT_PORT:-5140}:5140"
+    logging: *logging
+  app:
+    image: yesimbot-app:local
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: app
+    network_mode: service:net
+    depends_on: [net]
+    restart: unless-stopped
+    stop_grace_period: 50s
+    environment:
+      QQ_ACCOUNT: ${QQ_ACCOUNT:?Run scripts/install-linux.sh first}
+      ADMIN_PUBLIC_ORIGIN: ${ADMIN_PUBLIC_ORIGIN:-}
+      ADMIN_PASSWORD_FILE: /run/secrets/admin-password
+    volumes:
+      - ${YESIMBOT_DATA_DIR:-./.yesimbot-data}/koishi:/var/lib/yesimbot
+      - ${YESIMBOT_DATA_DIR:-./.yesimbot-data}/napcat-config:/app/napcat/config
+    secrets:
+      - admin-password
+    logging: *logging
+  # The app's init writes NapCat's settings and agent-wechat's token before either starts.
+  napcat:
+    image: mlikiowa/napcat-docker@sha256:d00a30e32f76d59a6c7de6b62985defb36b8889a7deaf1fb024170b8955298b6
+    platform: linux/amd64
+    network_mode: service:net
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 20s
+    working_dir: /app
+    entrypoint: ["/bin/bash", "/opt/yesimbot/start-napcat.sh"]
+    environment:
+      ACCOUNT: ${QQ_ACCOUNT}
+      NAPCAT_CONFIG_DIR: /app/napcat/config
+    volumes:
+      - ./docker/start-napcat.sh:/opt/yesimbot/start-napcat.sh:ro
+      - ${YESIMBOT_DATA_DIR:-./.yesimbot-data}/qq:/app/.config/QQ
+      - ${YESIMBOT_DATA_DIR:-./.yesimbot-data}/napcat-config:/app/napcat/config
+      - ${YESIMBOT_DATA_DIR:-./.yesimbot-data}/napcat-plugins:/app/napcat/plugins
+    shm_size: 512mb
+    # Upstream NapCat prints login QR codes and tokens; QQ login happens in the console.
+    logging:
+      driver: none
+  wechat:
+    image: yesimbot-wechat:local
+    platform: linux/amd64
+    network_mode: service:net
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - ${YESIMBOT_DATA_DIR:-./.yesimbot-data}/koishi/data/agent-wechat:/var/lib/yesimbot/data/agent-wechat
+    logging: *logging
+secrets:
+  admin-password:
+    file: ${YESIMBOT_DATA_DIR:-./.yesimbot-data}/admin-password

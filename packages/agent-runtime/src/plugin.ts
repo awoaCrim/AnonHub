@@ -1,0 +1,487 @@
+import type { LanguageModel, ModelMessage, SystemModelMessage } from "ai";
+
+import type { AgentChannel } from "./channel.js";
+import type { AgentEntry } from "./entry.js";
+import { createDiagnostic, createInternalEvent } from "./event.js";
+import type { AgentInternalEventInit } from "./event.js";
+import type { AgentMessage } from "./message.js";
+import type { AgentRequestProjection } from "./request-projection.js";
+import type { AgentStateManager } from "./state.js";
+import type { AgentStorage } from "./storage.js";
+import { mergeTools, type AgentToolSet, type ToolDecision } from "./tools.js";
+import type { TurnResult } from "./turn.js";
+
+export type SystemPromptBlock = string | SystemModelMessage;
+
+export type SystemPromptAppend = SystemPromptBlock | readonly SystemPromptBlock[];
+
+type Awaitable<T> = T | Promise<T>;
+
+/** One plugin's share of the frozen system prompt. */
+export interface SystemPromptSource {
+  readonly plugin: string;
+  readonly blocks: readonly SystemModelMessage[];
+}
+
+export interface AgentPluginRuntime {
+  readonly id: string;
+  readonly channel: AgentChannel;
+  readonly state: AgentStateManager;
+  readonly storage: AgentStorage<AgentEntry>;
+  getModel(): LanguageModel;
+  setModel(model: LanguageModel): void;
+}
+
+export interface AgentPlugin {
+  name: string;
+  version?: string;
+  enforce?: "pre" | "post";
+  optional?: boolean;
+  tools?: AgentToolSet | ((runtime: AgentPluginRuntime) => Awaitable<AgentToolSet | void>);
+  init?(runtime: AgentPluginRuntime): Awaitable<void>;
+  stop?(): Awaitable<void>;
+  onAppend?(entries: AgentEntry[], context: AppendHookContext): Awaitable<AgentEntry[] | void>;
+  transformEntries?(entries: readonly AgentEntry[], context?: EntryTransformContext): Awaitable<AgentEntry[] | void>;
+  /** Rewrites the history sent in each request; it must stay deterministic, or the prompt cache breaks. */
+  transformMessages?(messages: AgentMessage[], context: MessageTransformContext): Awaitable<AgentMessage[]>;
+  toModelMessages?(message: AgentMessage, context: ModelMessageContext): Awaitable<ModelMessage[] | ModelMessage | void>;
+  appendSystemPrompt?(context: PromptContext): Awaitable<SystemPromptAppend | void>;
+  /** Rewrites the stable tool set once at init, for changes that must see every tool (wrapping, aliases). */
+  extendTools?(tools: AgentToolSet, context: ToolExtensionContext): Awaitable<AgentToolSet | void>;
+  /** Filters stable tools at every provider step using the raw current-turn messages. */
+  filterTools?(tools: AgentToolSet, context: ToolFilterContext): Awaitable<AgentToolSet | void>;
+  beforeToolCall?(call: ToolCallContext, context: ToolHookContext): Awaitable<ToolDecision | void>;
+  afterToolCall?(result: ToolResultContext, context: ToolHookContext): Awaitable<Partial<ToolResultContext> | void>;
+  onTurnFinish?(result: TurnResult, context: TurnFinishContext): Awaitable<void>;
+  prepareStep?(messages: readonly ModelMessage[], context: PrepareStepContext): Awaitable<readonly ModelMessage[] | void>;
+}
+
+export interface HookContextBase {
+  readonly runtime: { id: string };
+  readonly channel: AgentChannel;
+  readonly state: AgentStateManager;
+  readonly signal?: AbortSignal;
+  readonly pluginName?: string;
+}
+
+export interface AppendHookContext extends HookContextBase {
+  readonly storage: AgentStorage;
+}
+
+/** Cancellation and turn identity for request-only historical entry transformations. */
+export interface EntryTransformContext extends HookContextBase {
+  readonly turnId?: string;
+}
+
+export interface MessageTransformContext extends HookContextBase {
+  readonly turnId?: string;
+}
+
+export interface ModelMessageContext extends HookContextBase {
+  readonly turnId?: string;
+  readonly projection?: AgentRequestProjection;
+  readonly history: readonly AgentMessage[];
+  readonly current: readonly AgentMessage[];
+  /** Most recently admitted input batch; retained across tool steps and request rebuilds. */
+  readonly activeInputs?: readonly AgentMessage[];
+  /** Messages produced during the active turn, including prior step inputs and tool continuations. */
+  readonly live?: readonly AgentMessage[];
+}
+
+export interface PromptContext extends HookContextBase {
+  readonly turnId?: string;
+}
+
+export interface ToolExtensionContext extends HookContextBase {
+  readonly turnId?: string;
+}
+
+export interface ToolFilterContext extends HookContextBase {
+  readonly turnId: string;
+  readonly stepNumber: number;
+  /** Raw current-turn AgentMessages, including joined messages and tool continuations. */
+  readonly messages: readonly AgentMessage[];
+}
+
+export interface ToolHookContext extends HookContextBase {
+  readonly turnId: string;
+  /** Raw current-turn AgentMessages, including joined messages and tool continuations. */
+  readonly messages: readonly AgentMessage[];
+}
+
+export interface TurnFinishContext extends HookContextBase {
+  readonly turnId: string;
+}
+
+export interface PrepareStepContext extends HookContextBase {
+  /** Trusted raw current-turn carriers for permission checks on injected context. */
+  readonly messages?: readonly AgentMessage[];
+  readonly projection?: AgentRequestProjection;
+  readonly turnId: string;
+  readonly stepNumber: number;
+}
+
+export interface ToolCallContext {
+  toolCallId: string;
+  toolName: string;
+  args: unknown;
+}
+
+export interface ToolResultContext extends ToolCallContext {
+  result: unknown;
+  isError: boolean;
+}
+
+export interface PluginHostRuntime extends AgentPluginRuntime {
+  readonly storage: AgentStorage<AgentEntry>;
+}
+
+export interface PluginHostHelpers {
+  onAppend(entries: AgentEntry[], context: AppendHookContext): Promise<AgentEntry[]>;
+  transformEntries(entries: readonly AgentEntry[], context?: EntryTransformContext): Promise<readonly AgentEntry[]>;
+  transformMessages(messages: AgentMessage[], context: MessageTransformContext): Promise<AgentMessage[]>;
+  toModelMessages(message: AgentMessage, context: ModelMessageContext): Promise<ModelMessage[]>;
+  prepareStep(messages: readonly ModelMessage[], context: PrepareStepContext): Promise<readonly ModelMessage[]>;
+  filterTools(tools: AgentToolSet, context: ToolFilterContext): Promise<AgentToolSet>;
+  beforeToolCall(decision: ToolDecision, call: ToolCallContext, context: ToolHookContext): Promise<ToolDecision>;
+  afterToolCall(result: ToolResultContext, context: ToolHookContext): Promise<ToolResultContext>;
+  onTurnFinish(result: TurnResult, context: TurnFinishContext): Promise<void>;
+}
+
+export interface PluginHostInitOptions {
+  baseTools?: AgentToolSet;
+}
+
+export interface PluginHost {
+  readonly plugins: readonly AgentPlugin[];
+  readonly activePlugins: readonly AgentPlugin[];
+  readonly stablePromptBlocks: readonly SystemModelMessage[];
+  /** The same blocks, grouped by the plugin that appended them, in order. */
+  readonly stablePromptSources: readonly SystemPromptSource[];
+  readonly stableTools: Readonly<AgentToolSet>;
+  readonly helpers: PluginHostHelpers;
+  init(options?: PluginHostInitOptions): Promise<void>;
+  stop(): Promise<void>;
+  emitPluginError(pluginName: string, error: unknown): void;
+}
+
+export function orderPlugins(plugins: readonly AgentPlugin[]): AgentPlugin[] {
+  const pre = plugins.filter((plugin) => plugin.enforce === "pre");
+  const normal = plugins.filter((plugin) => plugin.enforce !== "pre" && plugin.enforce !== "post");
+  const post = plugins.filter((plugin) => plugin.enforce === "post");
+  return [...pre, ...normal, ...post];
+}
+
+export function normalizeSystemPromptAppend(value: SystemPromptAppend): SystemModelMessage[] {
+  const blocks = Array.isArray(value) ? value : [value];
+  return blocks.map((block) =>
+    typeof block === "string"
+      ? { role: "system", content: block }
+      : {
+          ...block,
+          content: structuredClone(block.content),
+          ...(block.providerOptions === undefined ? {} : { providerOptions: structuredClone(block.providerOptions) }),
+        },
+  );
+}
+
+export function createPluginHost(options: { plugins: readonly AgentPlugin[]; runtime: PluginHostRuntime }): PluginHost {
+  const plugins = orderPlugins(options.plugins);
+  const activePlugins: AgentPlugin[] = [];
+  const stableTools: AgentToolSet = [];
+  const stablePromptBlocks: SystemModelMessage[] = [];
+  const stablePromptSources: SystemPromptSource[] = [];
+  let didInit = false;
+
+  const emitInternal = (event: AgentInternalEventInit) => {
+    void options.runtime.channel.emit("internal", createInternalEvent(event));
+  };
+
+  const emitPluginError = (pluginName: string, error: unknown) => {
+    emitInternal({ type: "plugin.error", plugin: pluginName, error: createDiagnostic(error) });
+  };
+
+  const stopPlugin = async (plugin: AgentPlugin) => {
+    try {
+      await plugin.stop?.();
+    } catch (error) {
+      emitPluginError(plugin.name, error);
+    }
+  };
+
+  const rollbackPlugins = async (currentPlugin?: AgentPlugin) => {
+    const pluginsToStop = currentPlugin ? [currentPlugin, ...[...activePlugins].reverse()] : [...activePlugins].reverse();
+
+    for (const plugin of pluginsToStop) {
+      await stopPlugin(plugin);
+    }
+
+    activePlugins.length = 0;
+    stableTools.length = 0;
+    stablePromptBlocks.length = 0;
+    stablePromptSources.length = 0;
+  };
+
+  const helpers: PluginHostHelpers = {
+    async onAppend(entries, context) {
+      let current = entries;
+
+      for (const plugin of activePlugins) {
+        const hook = plugin?.onAppend;
+        if (!hook) continue;
+
+        try {
+          const next = await hook(current, context);
+          if (next) current = next;
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+        }
+      }
+
+      return current;
+    },
+
+    async transformEntries(entries, context) {
+      let current: readonly AgentEntry[] = entries;
+      const hookContext = context ?? { runtime: { id: options.runtime.id }, channel: options.runtime.channel, state: options.runtime.state };
+
+      for (const plugin of activePlugins) {
+        const hook = plugin?.transformEntries?.bind(plugin);
+        if (!hook) continue;
+
+        try {
+          const next = await hook(current, hookContext);
+          if (next) current = next;
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+        }
+      }
+
+      return current;
+    },
+
+    async transformMessages(messages, context) {
+      let current = messages;
+
+      for (const plugin of activePlugins) {
+        const hook = plugin?.transformMessages;
+        if (!hook) continue;
+
+        try {
+          current = await hook(current, context);
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+        }
+      }
+
+      return current;
+    },
+
+    async toModelMessages(message, context) {
+      for (const plugin of activePlugins) {
+        const hook = plugin?.toModelMessages;
+        if (!hook) continue;
+
+        try {
+          const converted = await hook(message, context);
+          const messages = Array.isArray(converted) ? converted : converted ? [converted] : [];
+          if (messages.length > 0) {
+            return messages;
+          }
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+        }
+      }
+
+      return [];
+    },
+
+    async prepareStep(messages, context) {
+      let current = messages;
+
+      for (const plugin of activePlugins) {
+        const hook = plugin?.prepareStep;
+        if (!hook) continue;
+
+        try {
+          const next = await hook(current, context);
+          if (next) current = next;
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+        }
+      }
+
+      return current;
+    },
+
+    async filterTools(tools, context) {
+      let current = tools;
+
+      for (const plugin of activePlugins) {
+        const hook = plugin?.filterTools;
+        if (!hook) continue;
+
+        try {
+          const next = await hook(current, context);
+          if (next) current = next;
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+          current = [];
+        }
+      }
+
+      return current;
+    },
+
+    async beforeToolCall(decision, call, context) {
+      let currentDecision = decision;
+      let currentCall = call;
+
+      for (const plugin of activePlugins) {
+        const hook = plugin?.beforeToolCall;
+        if (!hook) continue;
+
+        try {
+          const next = await hook(currentCall, context);
+          if (!next) continue;
+
+          if (next.type === "allow") {
+            continue;
+          }
+
+          if (next.type === "replace") {
+            currentDecision = next;
+            currentCall = { ...currentCall, args: next.args };
+            continue;
+          }
+
+          if (next.type === "block") {
+            return next;
+          }
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+          return { type: "block", reason: "plugin-error" };
+        }
+      }
+
+      return currentDecision;
+    },
+
+    async afterToolCall(result, context) {
+      let current = result;
+
+      for (const plugin of activePlugins) {
+        const hook = plugin?.afterToolCall;
+        if (!hook) continue;
+
+        try {
+          const next = await hook(current, context);
+          if (next) current = { ...current, ...next };
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+        }
+      }
+
+      return current;
+    },
+
+    async onTurnFinish(result, context) {
+      for (const plugin of activePlugins) {
+        const hook = plugin?.onTurnFinish;
+        if (!hook) continue;
+
+        try {
+          await hook(result, context);
+        } catch (error) {
+          emitPluginError(plugin.name, error);
+        }
+      }
+    },
+  };
+  return {
+    plugins,
+    get activePlugins() {
+      return activePlugins;
+    },
+    get stablePromptBlocks() {
+      return stablePromptBlocks;
+    },
+    get stablePromptSources() {
+      return stablePromptSources;
+    },
+    get stableTools() {
+      return stableTools;
+    },
+    helpers,
+    async init(initOptions: PluginHostInitOptions = {}) {
+      if (didInit) return;
+      activePlugins.length = 0;
+      stablePromptBlocks.length = 0;
+      stablePromptSources.length = 0;
+      stableTools.length = 0;
+
+      const initializationContext: PromptContext & ToolExtensionContext = {
+        runtime: { id: options.runtime.id },
+        channel: options.runtime.channel,
+        state: options.runtime.state,
+      };
+      let nextTools = [...(initOptions.baseTools ?? [])];
+      const nextBlocks: SystemModelMessage[] = [];
+      const nextSources: SystemPromptSource[] = [];
+
+      for (const plugin of plugins) {
+        let didStartPlugin = false;
+        try {
+          await plugin.init?.(options.runtime);
+          didStartPlugin = true;
+
+          const declared = typeof plugin.tools === "function" ? await plugin.tools(options.runtime) : plugin.tools;
+          let candidateTools = mergeTools([nextTools, declared ?? []]);
+          const appended = await plugin.appendSystemPrompt?.(initializationContext);
+          const candidateBlocks = appended === undefined ? [] : normalizeSystemPromptAppend(appended);
+
+          if (plugin.extendTools) {
+            candidateTools = mergeTools([(await plugin.extendTools([...candidateTools], initializationContext)) ?? candidateTools]);
+          }
+
+          activePlugins.push(plugin);
+          nextTools = candidateTools;
+          nextBlocks.push(...candidateBlocks);
+          if (candidateBlocks.length) nextSources.push({ plugin: plugin.name, blocks: candidateBlocks });
+        } catch (error) {
+          if (didStartPlugin && plugin.optional) {
+            await stopPlugin(plugin);
+          }
+          if (plugin.optional) {
+            emitInternal({ type: "plugin.disabled", plugin: plugin.name, reason: createDiagnostic(error) });
+            continue;
+          }
+          await rollbackPlugins(didStartPlugin ? plugin : undefined);
+          throw error;
+        }
+      }
+
+      stablePromptBlocks.push(...nextBlocks);
+      stablePromptSources.splice(0, stablePromptSources.length, ...nextSources);
+      try {
+        stableTools.push(...mergeTools([nextTools]));
+      } catch (error) {
+        await rollbackPlugins();
+        throw error;
+      }
+      didInit = true;
+    },
+    async stop() {
+      for (const plugin of [...activePlugins].reverse()) {
+        await plugin.stop?.();
+      }
+
+      activePlugins.length = 0;
+      stableTools.length = 0;
+      stablePromptBlocks.length = 0;
+      stablePromptSources.length = 0;
+      didInit = false;
+    },
+    emitPluginError,
+  };
+}

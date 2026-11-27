@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The mark in white: an A without a crossbar, an orbit passing behind and in front of it (a band of the tile parts them where it crosses), a node. Same drawing as the web icons (plugins/console/web/public). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="908"
+    android:viewportHeight="908">
+    <group android:translateX="-58.75" android:translateY="-58.75">
+        <path android:pathData="M568.7 415.5A160 45 -28 0 1 701.3 394.9" android:strokeWidth="13" android:strokeLineCap="round" android:strokeColor="#FFFFFFFF" />
+        <path android:pathData="M315 675L470 368C490 328 534 328 554 368L712 675H640L512 410L385 675Z" android:fillColor="#FFFFFFFF" />
+        <group>
+            <clip-path android:pathData="M315 675L470 368C490 328 534 328 554 368L712 675H640L512 410L385 675Z" />
+            <path android:pathData="M701.3 394.9A160 45 -28 0 1 581.1 509.7A160 45 -28 0 1 420.5 547.7" android:strokeWidth="37" android:strokeLineCap="round" android:strokeColor="#FF181818" />
+            <path android:pathData="M358,562a54,54 0 1,0 108,0a54,54 0 1,0 -108,0" android:fillColor="#FF181818" />
+        </group>
+        <path android:pathData="M701.3 394.9A160 45 -28 0 1 581.1 509.7A160 45 -28 0 1 420.5 547.7" android:strokeWidth="13" android:strokeLineCap="round" android:strokeColor="#FFFFFFFF" />
+        <path android:pathData="M370,562a42,42 0 1,0 84,0a42,42 0 1,0 -84,0" android:fillColor="#FFFFFFFF" />
+    </group>
+</vector>

@@ -1,0 +1,29 @@
+{
+  "name": "@yesimbot/distribution-app",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "@yesimbot/server": "workspace:^",
+    "ai": "6.0.259",
+    "koishi-plugin-adapter-wechat-bridge": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "koishi-plugin-yesimbot-console": "workspace:^",
+    "koishi-plugin-yesimbot-device-connection": "workspace:^",
+    "koishi-plugin-yesimbot-google": "workspace:^",
+    "koishi-plugin-yesimbot-image-tools": "workspace:^",
+    "koishi-plugin-yesimbot-mcp-client": "workspace:^",
+    "koishi-plugin-yesimbot-memorizer": "workspace:^",
+    "koishi-plugin-yesimbot-message-debounce": "workspace:^",
+    "koishi-plugin-yesimbot-model-provider": "workspace:^",
+    "koishi-plugin-yesimbot-onebot-utils": "workspace:^",
+    "koishi-plugin-yesimbot-roleplay": "workspace:^",
+    "koishi-plugin-yesimbot-schedule": "workspace:^",
+    "koishi-plugin-yesimbot-search-service": "workspace:^",
+    "koishi-plugin-yesimbot-sticker-manager": "workspace:^",
+    "koishi-plugin-yesimbot-usage": "workspace:^",
+    "koishi-plugin-yesimbot-workspace": "workspace:^",
+    "koishi-plugin-yesimbot-xiaoheihe": "workspace:^",
+    "zod": "3.25.76"
+  }
+}

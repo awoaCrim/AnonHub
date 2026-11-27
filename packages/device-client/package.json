@@ -1,0 +1,39 @@
+{
+  "name": "@yesimbot/device-client",
+  "version": "0.0.1",
+  "private": true,
+  "bin": {
+    "yesimbot-device": "./dist/cli.js"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "pkgroll --sourcemap=inline",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@yesimbot/computer-driver": "workspace:^",
+    "@yesimbot/contracts": "workspace:^",
+    "@yesimbot/device-store": "workspace:^",
+    "@yesimbot/foundation": "workspace:^",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "about": {
+    "title": "让个人助手接手日常事务",
+    "description": "YesImBot 是可通过网页和聊天平台使用的个人 AI 助手，可按用户指令连接 Google 邮件、日历和网盘。"
+  },
+  "privacy": {
+    "title": "隐私政策",
+    "description": "YesImBot 本实例的隐私政策：说明 Google 用户数据的访问、使用、共享、存储和删除方式。"
+  },
+  "terms": {
+    "title": "服务条款",
+    "description": "YesImBot 本实例的服务条款，包含账号使用、Google 授权、助手操作和隐私说明。"
+  }
+}

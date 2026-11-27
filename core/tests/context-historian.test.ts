@@ -1,0 +1,599 @@
+import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { createEntry, type AgentEntry } from "@yesimbot/agent-runtime";
+import { APICallError } from "ai";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const generateText = vi.hoisted(() => vi.fn());
+vi.mock("ai", async (original) => ({ ...(await original<typeof import("ai")>()), generateText }));
+
+import { ContextBlockStore } from "../src/conversations/context-blocks.js";
+import { CONVERSATION_ERRORS, conversationError } from "../src/conversations/errors.js";
+import {
+  classifyContextRegionFailure,
+  generateContextRegionDraft,
+  validateContextRegionData,
+  validateContextRegionDraft,
+  type ContextRegionDraft,
+  type ContextRegionEntry,
+} from "../src/conversations/historian.js";
+import { Conversation } from "../src/conversations/index.js";
+
+const roots: string[] = [];
+afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+beforeEach(() => generateText.mockReset());
+const draft: ContextRegionDraft = {
+  tiers: { P1: "detailed historical banana facts", P2: "historical kiwi facts", P3: "pear fact", P4: "anchor" },
+  importance: 0.7,
+};
+const user = (id: string, text = id): AgentEntry => createEntry("message", { id, timestamp: 1, role: "user", content: text }, { id, timestamp: 1 });
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), "yesimbot-historian-"));
+  roots.push(root);
+  const conversation = new Conversation(root);
+  await conversation.init();
+  return { root, conversation, path: () => join(root, "sessions", conversation.currentSessionId() + ".jsonl") };
+}
+
+function speech(): AgentEntry[] {
+  return [
+    createEntry(
+      "message",
+      {
+        id: "call",
+        timestamp: 2,
+        role: "assistant",
+        content: [
+          { type: "text", text: "PRIVATE assistant" },
+          { type: "reasoning", text: "PRIVATE reasoning" },
+          {
+            type: "tool-call",
+            toolCallId: "send",
+            toolName: "send_message",
+            input: { messages: ["public speech<inner_thought>PRIVATE thought</inner_thought>"] },
+          },
+        ],
+      },
+      { id: "call", timestamp: 2 },
+    ),
+    createEntry(
+      "message",
+      {
+        id: "proof",
+        timestamp: 3,
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "send",
+            toolName: "send_message",
+            output: { type: "json", value: { ok: true, count: 1, messageIds: ["platform-id"] } },
+          },
+        ],
+      },
+      { id: "proof", timestamp: 3 },
+    ),
+  ];
+}
+
+async function commit(conversation: Conversation, ids: readonly string[]) {
+  return conversation.commitContextRegion(await conversation.freezeContextRegion(ids), draft);
+}
+
+describe("four-tier historian", () => {
+  it("generates all tiers from the original safe projection, with delivery proof outside the selected IDs", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("u", "  user public\n"), ...speech());
+    const frozen = await conversation.freezeContextRegion(["call", "u"]);
+    expect(frozen.sourceEntryIds).toEqual(["u", "call"]);
+    expect(frozen.records.map((record) => record.text)).toEqual(["  user public\n", "public speech"]);
+    expect(JSON.stringify(frozen)).not.toContain("PRIVATE");
+    generateText.mockResolvedValue({ text: JSON.stringify(draft) });
+    expect(await generateContextRegionDraft({ model: {} as never, records: frozen.records })).toEqual(draft);
+    expect(generateText).toHaveBeenCalledTimes(1);
+    const request = generateText.mock.calls[0]![0];
+    expect(request.prompt).toContain("public speech");
+    expect(request.prompt).not.toContain("PRIVATE");
+    expect(request.prompt).not.toContain("proof");
+    expect(request.system).toContain("同一原文");
+    expect(request.maxRetries).toBe(0);
+    expect(request.maxOutputTokens).toBe(8192);
+    expect(request.system).toContain("1200");
+    expect(request.system).toContain("软限制");
+    expect(request.system).toContain("未完成事项");
+    for (const rule of ["谁说了什么", "是否确认", "一次性玩笑", "固定称呼", "受托创作", "动机", "关键承诺"]) expect(request.system).toContain(rule);
+    expect(request.system.split("主要记录谁说了什么")).toHaveLength(2);
+  });
+  it.each([
+    [undefined, 8192],
+    [20000, 8192],
+    [1024, 1024],
+    [1, 1],
+  ] as const)("clamps auxiliary output limit %s to %s", async (outputLimit, expected) => {
+    generateText.mockResolvedValue({ text: JSON.stringify(draft) });
+    await generateContextRegionDraft({ model: {} as never, outputLimit, records: [{ entryId: "u", role: "user", timestamp: 1, text: "source" }] });
+    expect(generateText.mock.calls[0]![0].maxOutputTokens).toBe(expected);
+    expect(generateText.mock.calls[0]![0].maxRetries).toBe(0);
+  });
+  it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid output limit %s without calling the provider", async (outputLimit) => {
+    const failure = await generateContextRegionDraft({ model: {} as never, outputLimit, records: [] }).catch((cause) =>
+      classifyContextRegionFailure(cause, "model"),
+    );
+    expect(failure).toEqual({ phase: "model", code: "model-limit", retryable: 0 });
+    expect(generateText).not.toHaveBeenCalled();
+  });
+  it.each(["magic-region-v1", "magic-region-v2"])("keeps stored %s regions readable after the generation prompt changes", async (promptVersion) => {
+    const { conversation, path } = await fixture();
+    await conversation.storage.append(user("old"));
+    const frozen = await conversation.freezeContextRegion(["old"]);
+    expect(frozen.promptVersion).toBe("magic-region-v3");
+    const region = await conversation.commitContextRegion(frozen, draft);
+    const old = { ...region, data: { ...region.data, promptVersion } };
+    await writeFile(path(), [user("old"), old].map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+    expect((await conversation.contextRegions())[0]!.data.promptVersion).toBe(promptVersion);
+  });
+  it("fails oversized original input rather than silently truncating it", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("big", "中".repeat(30_000)));
+    await expect(conversation.freezeContextRegion(["big"])).rejects.toThrow("context_region_source_too_large");
+    await expect(
+      generateContextRegionDraft({ model: {} as never, records: [{ entryId: "big", role: "user", timestamp: 1, text: "x".repeat(70_000) }] }),
+    ).rejects.toThrow("context_region_source_too_large");
+    expect(generateText).not.toHaveBeenCalled();
+  });
+  it.each([
+    { ...draft, tiers: { P1: "long", P2: "", P3: "x", P4: "x" } },
+    { ...draft, tiers: { P1: "x", P2: "longer", P3: "x", P4: "x" } },
+    { ...draft, importance: 1.01 },
+    { ...draft, importance: NaN },
+    { ...draft, sourceSession: "invented" },
+    { ...draft, tiers: { ...draft.tiers, extra: "unknown" } },
+    { ...draft, tiers: { P1: "x".repeat(33_000), P2: "x", P3: "x", P4: "x" } },
+  ])("rejects incomplete/unbounded/non-descending/model-owned output %#", (value) => {
+    expect(() => validateContextRegionDraft(value)).toThrow("context_region_output_invalid");
+  });
+  it("requires strict JSON, not Markdown or extra model provenance", async () => {
+    generateText.mockResolvedValueOnce({ text: "```json\n" + JSON.stringify(draft) + "\n```" });
+    await expect(generateContextRegionDraft({ model: {} as never, records: [{ entryId: "u", role: "user", timestamp: 1, text: "hello" }] })).rejects.toThrow(
+      "context_region_output_invalid",
+    );
+  });
+  it("supports bounded manifests beyond the old 256-ID limit", async () => {
+    const { conversation } = await fixture();
+    const raw = Array.from({ length: 300 }, (_, index) => user(`u${index}`));
+    await conversation.storage.append(...raw);
+    const entry = await commit(
+      conversation,
+      raw.map((entry) => entry.id),
+    );
+    expect(entry.data.sourceEntryIds).toHaveLength(300);
+    expect(await conversation.contextRegions()).toEqual([entry]);
+  });
+});
+
+describe("sanitized historian failure evidence", () => {
+  const records = [{ entryId: "u", role: "user" as const, timestamp: 1, text: "public original" }];
+  const privateText = "PRIVATE sk-secret /private/path provider body chat text";
+  const api = (statusCode?: number, isRetryable = true) =>
+    new APICallError({
+      message: privateText,
+      url: "https://private.invalid/?token=sk-secret",
+      requestBodyValues: { prompt: privateText },
+      responseBody: privateText,
+      responseHeaders: { authorization: privateText },
+      statusCode,
+      isRetryable,
+      cause: new Error(privateText),
+      data: { privateText },
+    });
+
+  it.each([
+    [408, true, 1],
+    [429, true, 1],
+    [500, true, 1],
+    [599, true, 1],
+    [503, false, 0],
+    [400, true, 0],
+    [401, true, 0],
+    [403, true, 0],
+    [409, true, 0],
+  ] as const)("bounds HTTP classification without adopting SDK's 409 retry policy (%s/%s)", (status, retryable, expected) => {
+    expect(classifyContextRegionFailure(api(status, retryable), "model")).toEqual({
+      phase: "model",
+      code: "model-http",
+      httpStatus: status,
+      retryable: expected,
+    });
+  });
+  it.each([NaN, Infinity, -1, 99, 600, 429.5])("does not expose or retry invalid HTTP status %s", (status) => {
+    expect(classifyContextRegionFailure(api(status), "model")).toEqual({ phase: "model", code: "model-unknown", retryable: 0 });
+  });
+  it("recognizes only known statusless SDK, transport and timeout errors; storage never inherits retries", () => {
+    expect(classifyContextRegionFailure(api(), "model")).toEqual({ phase: "model", code: "model-unknown", retryable: 0 });
+    const network = api();
+    Object.assign(network.cause as Error, { code: "ECONNRESET" });
+    expect(classifyContextRegionFailure(network, "model")).toEqual({ phase: "model", code: "model-network", retryable: 1 });
+    expect(classifyContextRegionFailure(api(undefined, false), "model")).toEqual({ phase: "model", code: "model-unknown", retryable: 0 });
+    expect(classifyContextRegionFailure(new Error(privateText, { cause: Object.assign(new Error(privateText), { code: "ECONNRESET" }) }), "model")).toEqual({
+      phase: "model",
+      code: "model-network",
+      retryable: 1,
+    });
+    expect(classifyContextRegionFailure(new DOMException(privateText, "TimeoutError"), "model")).toEqual({
+      phase: "model",
+      code: "model-timeout",
+      retryable: 1,
+    });
+    expect(classifyContextRegionFailure(new TypeError("fetch failed " + privateText), "model")).toEqual({
+      phase: "model",
+      code: "model-unknown",
+      retryable: 0,
+    });
+    expect(classifyContextRegionFailure(api(503), "commit")).toEqual({ phase: "commit", code: "commit-failed", retryable: 0 });
+    expect(classifyContextRegionFailure(new Error("constructor"), "source")).toEqual({ phase: "source", code: "source-failed", retryable: 0 });
+    expect(classifyContextRegionFailure(conversationError(CONVERSATION_ERRORS.context_region_stale), "commit")).toEqual({
+      phase: "commit",
+      code: "stale-context",
+      retryable: 0,
+    });
+    const controller = new AbortController();
+    controller.abort(new Error(privateText));
+    expect(classifyContextRegionFailure(api(429), "model", controller.signal)).toEqual({ phase: "model", code: "cancelled", retryable: 0 });
+    expect(classifyContextRegionFailure(new DOMException(privateText, "AbortError"), "model")).toEqual({ phase: "model", code: "cancelled", retryable: 0 });
+  });
+  it("drops raw model error details instead of carrying them in the generated failure", async () => {
+    generateText.mockRejectedValueOnce(api(503));
+    const failure = await generateContextRegionDraft({ model: {} as never, records }).catch((cause: unknown) => cause);
+    expect(classifyContextRegionFailure(failure, "model")).toEqual({ phase: "model", code: "model-http", httpStatus: 503, retryable: 1 });
+    expect(JSON.stringify(failure)).not.toContain("PRIVATE");
+    expect(String(failure)).not.toContain("sk-secret");
+    expect(failure).not.toHaveProperty("cause");
+  });
+  it.each([
+    [privateText, "output-json"],
+    [JSON.stringify({ ...draft, importance: 2, privateText }), "output-schema"],
+    [privateText.repeat(1000), "output-too-large"],
+  ])("keeps output validation strict but permits one bounded regeneration (%s)", async (text, code) => {
+    generateText.mockResolvedValueOnce({ text, finishReason: "length", rawFinishReason: privateText });
+    const output = vi.fn();
+    const failure = await generateContextRegionDraft({ model: {} as never, records, onOutput: output }).catch((cause: unknown) => cause);
+    const expected = { phase: "output", code, retryable: 1, finishReason: "length", outputBytes: Buffer.byteLength(text, "utf8") };
+    expect(classifyContextRegionFailure(failure, "model")).toEqual(expected);
+    expect(output).toHaveBeenCalledWith({ finishReason: "length", outputBytes: expected.outputBytes });
+    expect(String(failure)).toContain("context_region_output_invalid");
+    expect(JSON.stringify(failure)).not.toContain("PRIVATE");
+    expect(failure).not.toHaveProperty("cause");
+  });
+  it("allowlists finish reasons and ignores observer exceptions without invalidating valid output", async () => {
+    generateText.mockResolvedValueOnce({ text: JSON.stringify(draft), finishReason: privateText });
+    const output = vi.fn(() => {
+      throw new Error(privateText);
+    });
+    expect(await generateContextRegionDraft({ model: {} as never, records, onOutput: output })).toEqual(draft);
+    expect(output).toHaveBeenCalledWith({ finishReason: "unknown", outputBytes: Buffer.byteLength(JSON.stringify(draft), "utf8") });
+    expect(generateText).toHaveBeenCalledOnce();
+  });
+});
+
+describe("atomic region commits and lifecycle", () => {
+  it("allows concurrent tail append during auxiliary generation, then appends one complete recoverable record", async () => {
+    const { conversation, root, path } = await fixture();
+    await conversation.storage.append(user("u1"));
+    const frozen = await conversation.freezeContextRegion(["u1"]);
+    let release!: (value: { text: string }) => void;
+    generateText.mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const pending = generateContextRegionDraft({ model: {} as never, records: frozen.records });
+    await conversation.storage.append(user("tail")); // Must resolve while the model is still blocked.
+    expect((await conversation.storage.read()).map((entry) => entry.id)).toEqual(["u1", "tail"]);
+    release({ text: JSON.stringify(draft) });
+    const entry = await conversation.commitContextRegion(frozen, await pending);
+    const lines = (await readFile(path(), "utf8")).trim().split("\n");
+    expect(lines).toHaveLength(3);
+    expect(JSON.parse(lines[2]!)).toEqual(entry);
+    const restarted = new Conversation(root);
+    await restarted.init();
+    expect(await restarted.contextRegions()).toEqual([entry]);
+    expect(generateText).toHaveBeenCalledTimes(1); // Recovery never invokes a model.
+  });
+  it("deduplicates concurrent same-source commits and rejects overlaps without changing raw", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("u1"), user("u2"), user("u3"));
+    const frozen = await conversation.freezeContextRegion(["u1", "u2"]);
+    const [first, second] = await Promise.all([conversation.commitContextRegion(frozen, draft), conversation.commitContextRegion(frozen, draft)]);
+    expect(first.id).toBe(second.id);
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "context-region")).toHaveLength(1);
+    await expect(commit(conversation, ["u2", "u3"])).rejects.toThrow("context_region_source_conflict");
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "message")).toHaveLength(3);
+  });
+  it("rejects stale switch/back, archive and clear generations, even when IDs/session return", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("u1"));
+    const frozen = await conversation.freezeContextRegion(["u1"]);
+    const source = conversation.currentSessionId();
+    await conversation.archive(true);
+    await conversation.switch(source);
+    expect(conversation.currentSessionId()).toBe(frozen.sessionId);
+    expect(conversation.storageGeneration).toBeGreaterThan(frozen.storageGeneration);
+    await expect(conversation.commitContextRegion(frozen, draft)).rejects.toThrow("context_region_stale");
+    const beforeArchive = await conversation.freezeContextRegion(["u1"]);
+    await conversation.archive(false);
+    await expect(conversation.commitContextRegion(beforeArchive, draft)).rejects.toThrow("context_region_stale");
+    const beforeClear = await conversation.freezeContextRegion(["u1"]);
+    await conversation.storage.clear();
+    await conversation.storage.append(user("u1"));
+    await expect(conversation.commitContextRegion(beforeClear, draft)).rejects.toThrow("context_region_stale");
+  });
+  it("checks cancellation inside a queued mutation, not only before queueing", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("u1"));
+    const frozen = await conversation.freezeContextRegion(["u1"]);
+    const fileStorage = (conversation as unknown as { currentStorage(): { read(): Promise<readonly AgentEntry[]> } }).currentStorage();
+    const canonical = await conversation.storage.read();
+    let entered!: () => void;
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(fileStorage, "read").mockImplementationOnce(async () => {
+      entered();
+      await gate;
+      return canonical;
+    });
+    const holding = conversation.freezeContextRegion(["u1"]);
+    await ready;
+    const controller = new AbortController();
+    const pending = conversation.commitContextRegion(frozen, draft, controller.signal);
+    controller.abort(new Error("StoppedContextJob"));
+    release();
+    await holding;
+    await expect(pending).rejects.toThrow("StoppedContextJob");
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "context-region")).toEqual([]);
+  });
+  it("rejects forged frozen values and malformed/duplicate/missing sources", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("u1"));
+    const frozen = await conversation.freezeContextRegion(["u1"]);
+    await expect(conversation.commitContextRegion({ ...frozen }, draft)).rejects.toThrow("context_region_stale");
+    for (const ids of [[], ["u1", "u1"], ["missing"]]) await expect(conversation.freezeContextRegion(ids)).rejects.toThrow(/context_region_source/);
+    await conversation.storage.append(user("u1"));
+    await expect(conversation.freezeContextRegion(["u1"])).rejects.toThrow("context_region_source_conflict");
+  });
+  it("rechecks readable projection when a duplicate delivery receipt outside the selected range is appended", async () => {
+    const { conversation } = await fixture();
+    const delivered = speech();
+    await conversation.storage.append(...delivered);
+    const frozen = await conversation.freezeContextRegion(["call"]);
+    await conversation.storage.append({ ...delivered[1]!, id: "duplicate-proof" });
+    await expect(conversation.commitContextRegion(frozen, draft)).rejects.toThrow(/context_region_source/);
+    expect(await conversation.contextRegions()).toEqual([]);
+  });
+  it("invalidates an already committed source when external delivery proof changes on disk", async () => {
+    const { conversation, root, path } = await fixture();
+    await conversation.storage.append(...speech());
+    const entry = await commit(conversation, ["call"]);
+    const before = await conversation.storage.read();
+    const modified = before.map((candidate) =>
+      candidate.id === "proof"
+        ? createEntry(
+            "message",
+            {
+              id: "proof",
+              timestamp: 3,
+              role: "tool",
+              content: [
+                { type: "tool-result", toolCallId: "send", toolName: "send_message", output: { type: "json", value: { ok: false, sent: [], failedAt: 0 } } },
+              ],
+            },
+            { id: "proof", timestamp: 3 },
+          )
+        : candidate,
+    );
+    await writeFile(path(), modified.map((candidate) => JSON.stringify(candidate)).join("\n") + "\n");
+    const restarted = new Conversation(root);
+    await restarted.init();
+    expect(await restarted.contextRegions()).toEqual([]);
+    const store = new ContextBlockStore(() => restarted.contextSources());
+    await expect(store.page({ blockId: entry.id }, 2048)).rejects.toThrow("context_block_not_accessible");
+  });
+  it("ignores partial/invalid/conflicting records on restart and excludes them from archive seeds", async () => {
+    const { conversation, root } = await fixture();
+    await conversation.storage.append(user("u1"));
+    const entry = await commit(conversation, ["u1"]);
+    const incomplete = { ...entry, id: "incomplete", data: { ...entry.data, tiers: { P1: "only one tier" } } } as ContextRegionEntry;
+    await conversation.storage.append(incomplete, { ...entry, data: { ...entry.data, tiers: { ...entry.data.tiers, P4: "other" } } });
+    const restarted = new Conversation(root);
+    await restarted.init();
+    expect(await restarted.contextRegions()).toEqual([]);
+    await restarted.archive(false);
+    expect((await restarted.storage.read()).filter((candidate) => candidate.type === "context-region")).toEqual([]);
+    expect((await restarted.storage.read()).filter((candidate) => candidate.type === "message")).toHaveLength(1);
+  });
+  it("recovers complete commits before a torn final region and safely appends after restart", async () => {
+    const { conversation, root, path } = await fixture();
+    await conversation.storage.append(user("u1"));
+    const entry = await commit(conversation, ["u1"]);
+    await appendFile(path(), '{"type":"context-region","data":');
+    const restarted = new Conversation(root);
+    await restarted.init();
+    expect(await restarted.contextRegions()).toEqual([entry]);
+    await restarted.storage.append(user("tail"));
+    expect((await restarted.storage.read()).map((candidate) => candidate.id)).toEqual(["u1", entry.id, "tail"]);
+  });
+});
+
+describe("Magic archive and history access", () => {
+  it("carries verified regions, proof and all uncovered tail; history stays readable after a restart", async () => {
+    const { conversation, root } = await fixture();
+    await conversation.storage.append(user("u1"), ...speech());
+    const originalSession = conversation.currentSessionId();
+    const entry = await commit(conversation, ["u1", "call", "proof"]);
+    await conversation.storage.append(user("tail", "uncovered tail"));
+    await conversation.archive();
+    expect(generateText).not.toHaveBeenCalled();
+    expect(conversation.currentSessionId()).not.toBe(originalSession);
+    expect(await conversation.contextRegions()).toEqual([entry]);
+    expect((await conversation.storage.read()).filter((candidate) => candidate.type === "message").map((candidate) => candidate.id)).toEqual(["tail"]);
+    expect((await conversation.contextRegions())[0]!.data.sourceSession).toBe(originalSession);
+    const restarted = new Conversation(root);
+    await restarted.init();
+    expect((await restarted.storage.read()).filter((candidate) => candidate.type === "message").map((candidate) => candidate.id)).toEqual(["tail"]);
+    const store = new ContextBlockStore(() => conversation.contextSources());
+    expect((await store.page({ blockId: entry.id }, 2048)).records.map((record) => record.text)).toEqual(["u1", "public speech"]);
+    expect((await store.list({ query: "kiwi" })).blocks.map((block) => block.id)).toContain(entry.id); // P2 search, not only preview.
+    expect((await store.list({ query: "pear" })).blocks.map((block) => block.id)).toContain(entry.id); // P3 search.
+    expect((await store.list({ query: "anchor" })).blocks.map((block) => block.id)).toContain(entry.id); // P4 search.
+  });
+  it("ctx_search finds what a summary dropped in the original records, with the sentence, time and speaker", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("u1", "阿依是战神啊2"), ...speech(), user("u2", "冠军一扣四"));
+    const entry = await commit(conversation, ["u1", "call", "proof", "u2"]);
+    await conversation.storage.append(user("tail", "最近的新消息"));
+    const store = new ContextBlockStore(() => conversation.contextSources());
+    const found = await store.list({ query: "战神" });
+    expect(found.blocks.map((block) => block.id)).toEqual([entry.id]);
+    expect(found.blocks[0]).toMatchObject({ matchedIn: "source", hits: [{ entryId: "u1", role: "user", text: "阿依是战神啊2" }] });
+    expect(found.blocks[0]!.hits![0]!.time).toMatch(/^\d{4}-\d{2}-\d{2} 周[日一二三四五六] \d{2}:\d{2}（UTC[+-]\d+(?::\d{2})?）$/);
+    expect(found.note).toContain("只读历史原文");
+    // A single character is found too, not only two-character pairs.
+    expect((await store.list({ query: "扣" })).blocks[0]!.hits!.map((hit) => hit.text)).toEqual(["冠军一扣四"]);
+    // What the bot itself said is searchable, so it can see it already answered.
+    expect((await store.list({ query: "public speech" })).blocks[0]!.hits![0]).toMatchObject({ role: "assistant", text: "public speech" });
+    // A summary-only match still lists the block, without hits; nothing matches nothing.
+    const summary = await store.list({ query: "kiwi" });
+    expect(summary.blocks.find((block) => block.id === entry.id)).toMatchObject({ matchedIn: "summary" });
+    expect(summary.blocks.find((block) => block.id === entry.id)!.hits).toBeUndefined();
+    expect(summary.note).toBeUndefined();
+    expect((await store.list({ query: "不存在的词" })).blocks).toEqual([]);
+    // The raw tail is searchable by its full text, and the best match comes first.
+    expect((await store.list({ query: "新消息" })).blocks[0]).toMatchObject({ kind: "raw", matchedIn: "source" });
+    const ranked = await store.list({ query: "冠军 最近" });
+    expect(ranked.blocks).toHaveLength(2);
+  });
+  it("locates an original record inside a summarized block, also after its session was archived", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("old", "x".repeat(10000)), user("quoted", "被引用的原话"), user("tail", "最近"));
+    const region = await commit(conversation, ["old", "quoted"]);
+    const store = new ContextBlockStore(() => conversation.contextSources());
+    const byId = (id: string) => (entry: AgentEntry) => entry.id === id;
+    expect(await store.locate(byId("quoted"))).toMatchObject({ block: { id: region.id, kind: "context-region" }, entry: { id: "quoted" } });
+    expect((await store.locate(byId("tail")))?.block.kind).toBe("raw");
+    expect(await store.locate(byId("missing"))).toBeUndefined();
+    expect(await conversation.archiveIfOversize(1)).toBe(true);
+    expect((await conversation.storage.read()).some((entry) => entry.id === "quoted")).toBe(false);
+    expect(await store.locate(byId("quoted"))).toMatchObject({ block: { id: region.id }, entry: { id: "quoted" } });
+  });
+  it("cuts a long hit around the match and bounds the hits one page carries", async () => {
+    const { conversation } = await fixture();
+    const long = `${"前".repeat(300)}战神${"后".repeat(300)}`;
+    await conversation.storage.append(...Array.from({ length: 40 }, (_, i) => user(`u${i}`, `${i} ${long}`)));
+    const store = new ContextBlockStore(() => conversation.contextSources());
+    const found = await store.list({ query: "战神", limit: 20 });
+    const hits = found.blocks.flatMap((block) => block.hits ?? []);
+    expect(hits[0]!.text).toContain("战神");
+    expect(hits[0]!.text.startsWith("…")).toBe(true);
+    expect(hits[0]!.text.endsWith("…")).toBe(true);
+    expect(Array.from(hits[0]!.text).length).toBeLessThanOrEqual(122);
+    expect(Buffer.byteLength(JSON.stringify(hits), "utf8")).toBeLessThanOrEqual(8000 + 64);
+    expect(found.blocks).toHaveLength(20);
+  });
+  it("preserves every raw tail even when there are no regions, for manual and size archives", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("u1"), user("u2"));
+    expect(await conversation.archiveIfOversize(0, { model: {} as never })).toBe(false);
+    await conversation.archive();
+    expect((await conversation.storage.read()).map((entry) => entry.id)).toEqual(["u1", "u2"]);
+    const session = conversation.currentSessionId();
+    expect(await conversation.archiveIfOversize(1, { model: {} as never })).toBe(false);
+    expect(conversation.currentSessionId()).toBe(session); // No new oversized copy on every input.
+    expect((await conversation.storage.read()).map((entry) => entry.id)).toEqual(["u1", "u2"]);
+    expect(generateText).not.toHaveBeenCalled();
+  });
+  it("auto-archives useful coverage once without copying covered raw or rotating the same oversized seed", async () => {
+    const { conversation, root, path } = await fixture();
+    await conversation.storage.append(user("old", "x".repeat(10000)), user("tail"));
+    const region = await commit(conversation, ["old"]);
+    const original = path();
+    const originalBytes = await readFile(original);
+    expect(await conversation.archiveIfOversize(1)).toBe(true);
+    expect((await conversation.storage.read()).some((entry) => entry.id === "old")).toBe(false);
+    expect(await readFile(original)).toEqual(originalBytes);
+    const archived = conversation.currentSessionId();
+    expect(await conversation.archiveIfOversize(1)).toBe(false);
+    expect(conversation.currentSessionId()).toBe(archived);
+    const restored = new Conversation(root);
+    await restored.init();
+    expect(await restored.contextRegions()).toEqual([region]);
+  });
+  it("does not split canonical tool pairs when a legacy partial source manifest is archived", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(...speech());
+    await commit(conversation, ["call"]);
+    await conversation.archive(false);
+    expect((await conversation.storage.read()).filter((entry) => entry.type === "message").map((entry) => entry.id)).toEqual(["call", "proof"]);
+  });
+  it("noSummary starts an empty isolated lineage and cannot retrieve old regions", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("u1"));
+    const entry = await commit(conversation, ["u1"]);
+    await conversation.archive(true);
+    expect(await conversation.storage.read()).toEqual([]);
+    expect(await conversation.contextRegions()).toEqual([]);
+    const store = new ContextBlockStore(() => conversation.contextSources());
+    expect((await store.list({ query: "banana" })).blocks).toEqual([]);
+    await expect(store.page({ blockId: entry.id }, 2048)).rejects.toThrow("context_block_not_accessible");
+    await conversation.storage.append(user("new"));
+    expect((await conversation.freezeContextRegion(["new"])).lineageId).toBe(conversation.currentSessionId());
+  });
+  it("paginates region raw bodies directly and invalidates old proof cursors", async () => {
+    const { conversation, path } = await fixture();
+    const delivered = speech();
+    const call = delivered[0]! as Extract<AgentEntry, { type: "message" }>;
+    const toolCall = (call.data.content as { input?: { messages: string[] } }[])[2]!;
+    toolCall.input!.messages = ["public".repeat(1500)];
+    await conversation.storage.append(...delivered);
+    const entry = await commit(conversation, ["call"]);
+    const store = new ContextBlockStore(() => conversation.contextSources());
+    const first = await store.page({ blockId: entry.id }, 512);
+    expect(first.nextCursor).toBeDefined();
+    let cursor = first.nextCursor;
+    let text = first.records.map((record) => record.text).join("");
+    while (cursor) {
+      const page = await store.page({ blockId: entry.id, cursor }, 512);
+      text += page.records.map((record) => record.text).join("");
+      cursor = page.nextCursor;
+    }
+    expect(text).toBe("public".repeat(1500));
+    const entries = await conversation.storage.read();
+    await writeFile(
+      path(),
+      entries
+        .filter((candidate) => candidate.id !== "proof")
+        .map((candidate) => JSON.stringify(candidate))
+        .join("\n") + "\n",
+    );
+    await expect(store.page({ blockId: entry.id, cursor: first.nextCursor }, 512)).rejects.toThrow("context_block_not_accessible");
+  });
+  it("validates persisted version/provenance rather than trusting a complete-looking tier object", async () => {
+    const { conversation } = await fixture();
+    await conversation.storage.append(user("u1"));
+    const entry = await commit(conversation, ["u1"]);
+    for (const patch of [
+      { version: 2 },
+      { sourceSession: "../other" },
+      { sourceEntryIds: ["u1", "u1"] },
+      { sourceFingerprint: "made up" },
+      { sourceStartAt: 2, sourceEndAt: 1 },
+    ]) {
+      expect(() => validateContextRegionData({ ...entry.data, ...patch })).toThrow();
+    }
+  });
+});

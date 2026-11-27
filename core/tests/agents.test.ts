@@ -1,0 +1,248 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type { AgentPlugin } from "@yesimbot/agent-runtime";
+import { partsFromElements } from "@yesimbot/contracts/parts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("ai", async (importOriginal) => {
+  const original = await importOriginal<typeof import("ai")>();
+  return { ...original, generateText: vi.fn() };
+});
+
+import { generateText } from "ai";
+
+import type { ChatAccount } from "../src/accounts.js";
+import { Agents, type ChannelPlugin } from "../src/agents/index.js";
+import { createDescribeImageTool, createReadTool } from "../src/agents/tools.js";
+import { type WillEngine, type WillPlugin } from "../src/agents/will.js";
+import type { ChannelContext } from "../src/channels/index.js";
+import { createMessage, type MessageRecord } from "../src/messages/index.js";
+import { ChannelResources } from "../src/resources/index.js";
+import { PNG_BYTES, h } from "./helpers/index.js";
+
+const roots: string[] = [];
+
+afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+
+// ---------------------------------------------------------------------------
+// createDescribeImageTool
+// ---------------------------------------------------------------------------
+
+async function createResources(): Promise<ChannelResources> {
+  const root = await mkdtemp(join(tmpdir(), "yesimbot-describe-image-"));
+  roots.push(root);
+  return new ChannelResources(root);
+}
+
+const VALID_URI = `asset://${"a".repeat(32)}`;
+
+describe("createDescribeImageTool", () => {
+  it("describes an asset image through the vision model", async () => {
+    const resources = await createResources();
+    const id = await resources.assets.put(PNG_BYTES);
+    vi.mocked(generateText).mockResolvedValueOnce({
+      text: "一只猫在沙发上",
+      steps: [],
+      warnings: [],
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    } as never);
+    const tool = createDescribeImageTool({} as never, resources);
+
+    const result = await tool.execute({ uri: `asset://${id}`, question: "图片里有什么？" }, { toolCallId: "call", abortSignal: undefined } as never);
+
+    expect(result).toEqual({ text: "一只猫在沙发上" });
+    const options = vi.mocked(generateText).mock.calls[0]![0] as {
+      messages: Array<{ content: Array<{ type: string; text?: string; data?: Uint8Array; mediaType?: string }> }>;
+    };
+    const parts = options.messages[0]!.content;
+    expect(parts[0]).toMatchObject({ type: "text" });
+    expect(parts[0]!.text).toContain("图片里有什么？");
+    expect(parts[0]!.text).toContain("区分可见事实与推测");
+    expect(parts[0]!.text).toContain("无法确认具体身份");
+    expect(parts[1]).toMatchObject({ type: "file", mediaType: "image/png" });
+    expect(parts[1]!.data).toEqual(PNG_BYTES);
+  });
+
+  it("rejects malformed URIs without touching the asset store", async () => {
+    const resources = await createResources();
+    const get = vi.spyOn(resources.assets, "get");
+    const tool = createDescribeImageTool({} as never, resources);
+
+    await expect(tool.execute({ uri: "asset://SHORT", question: "什么" }, { toolCallId: "call", abortSignal: undefined } as never)).resolves.toEqual({
+      error: "invalid_uri",
+    });
+    await expect(tool.execute({ uri: "artifact://mcp/x", question: "什么" }, { toolCallId: "call", abortSignal: undefined } as never)).resolves.toEqual({
+      error: "invalid_uri",
+    });
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing asset", async () => {
+    const resources = await createResources();
+    const tool = createDescribeImageTool({} as never, resources);
+
+    await expect(tool.execute({ uri: VALID_URI, question: "什么" }, { toolCallId: "call", abortSignal: undefined } as never)).resolves.toEqual({
+      error: "asset_not_found",
+    });
+  });
+
+  it("rejects non-image bytes", async () => {
+    const resources = await createResources();
+    const id = await resources.assets.put(new Uint8Array([1, 2, 3]));
+    const tool = createDescribeImageTool({} as never, resources);
+
+    await expect(tool.execute({ uri: `asset://${id}`, question: "什么" }, { toolCallId: "call", abortSignal: undefined } as never)).resolves.toEqual({
+      error: "not_an_image",
+    });
+  });
+
+  it("surfaces a failed vision call as an error result", async () => {
+    const resources = await createResources();
+    const id = await resources.assets.put(PNG_BYTES);
+    vi.mocked(generateText).mockRejectedValueOnce(new Error("boom"));
+    const tool = createDescribeImageTool({} as never, resources);
+
+    await expect(tool.execute({ uri: `asset://${id}`, question: "什么" }, { toolCallId: "call", abortSignal: undefined } as never)).resolves.toEqual({
+      error: "vision_call_failed",
+    });
+  });
+
+  it("automatically uses the configured vision model for read fallback", async () => {
+    const resources = await createResources();
+    const id = await resources.assets.put(PNG_BYTES);
+    vi.mocked(generateText).mockResolvedValueOnce({
+      text: "图片里是一只猫",
+      steps: [],
+      warnings: [],
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    } as never);
+    const tool = createReadTool(resources, { mode: "vision", visionModel: {} as never });
+
+    const result = await tool.execute({ uri: `asset://${id}` }, { toolCallId: "read-call", turnId: "turn-1", abortSignal: undefined } as never);
+
+    expect(result).toMatchObject({
+      uri: `asset://${id}`,
+      mediaType: "image/png",
+      imageMode: "vision",
+      text: "图片里是一只猫",
+    });
+    expect(JSON.stringify(result)).not.toContain(Buffer.from(PNG_BYTES).toString("base64"));
+    const options = vi.mocked(generateText).mock.calls.at(-1)?.[0] as {
+      messages: Array<{ content: Array<{ type: string; data?: Uint8Array; mediaType?: string }> }>;
+    };
+    expect(options.messages[0]!.content[1]).toMatchObject({ type: "file", data: PNG_BYTES, mediaType: "image/png" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+
+const scope: ChannelContext = { type: "guild", platform: "test", channelId: "room-1", guildId: "room-1" };
+
+const directScope: ChannelContext = { type: "direct", platform: "test", selfId: "bot-1", channelId: "room-1", userId: "user-1" };
+
+function message(channelType: number, elements = [h.text("hello")]) {
+  return createMessage({
+    platform: "test",
+    selfId: "bot-1",
+    timestamp: 1,
+    channel: { id: "room-1", type: channelType },
+    user: { id: "user-1", name: "User" },
+    messageId: "message-1",
+    parts: partsFromElements(elements),
+  } satisfies MessageRecord);
+}
+
+class TestChannelPlugin implements ChannelPlugin {
+  public constructor(
+    private readonly plugin: AgentPlugin | null,
+    private readonly failure?: Error,
+  ) {}
+
+  public setup(_scope: ChannelContext, _bot: ChatAccount): AgentPlugin | null {
+    if (this.failure) throw this.failure;
+    return this.plugin;
+  }
+}
+
+class TestWillPlugin implements WillPlugin {
+  public constructor(
+    public readonly priority: number,
+    private readonly matches: boolean,
+    private readonly will: WillEngine,
+  ) {}
+
+  public match(_context: ChannelContext): boolean {
+    return this.matches;
+  }
+
+  public setup(_scope: ChannelContext): WillEngine {
+    return this.will;
+  }
+}
+
+describe("Agents", () => {
+  it("exposes only agent plugin and will registrations", () => {
+    const agents = new Agents();
+
+    expect(agents).toMatchObject({ use: expect.any(Function), will: expect.any(Function) });
+    expect("model" in agents).toBe(false);
+    expect("usage" in agents).toBe(false);
+    expect("guard" in agents).toBe(false);
+    expect("resolveModel" in agents).toBe(false);
+    expect("reportUsage" in agents).toBe(false);
+    expect("allowTrigger" in agents).toBe(false);
+  });
+
+  it("registers and disposes channel plugins in stable order", async () => {
+    const agents = new Agents();
+    const first = { name: "first" } satisfies AgentPlugin;
+    const second = { name: "second" } satisfies AgentPlugin;
+    const disposeFirst = agents.use(new TestChannelPlugin(first));
+    agents.use(new TestChannelPlugin(second));
+    await expect(agents.setup(scope, {} as ChatAccount)).resolves.toEqual([first, second]);
+    disposeFirst();
+    await expect(agents.setup(scope, {} as ChatAccount)).resolves.toEqual([second]);
+  });
+
+  it("rolls back initialized plugins in reverse order while preserving the primary error", async () => {
+    const agents = new Agents();
+    const firstStop = vi.fn(async () => undefined);
+    const secondStop = vi.fn(async () => undefined);
+    const primary = new Error("third failed");
+    agents.use(new TestChannelPlugin({ name: "first", stop: firstStop }));
+    agents.use(new TestChannelPlugin({ name: "second", stop: secondStop }));
+    agents.use(new TestChannelPlugin(null, primary));
+
+    await expect(agents.setup(scope, {} as ChatAccount)).rejects.toBe(primary);
+    expect(secondStop).toHaveBeenCalledBefore(firstStop);
+  });
+
+  it("selects the first matching WillPlugin by priority then registration order", async () => {
+    const agents = new Agents();
+    const first = { decide: vi.fn(async () => "wait" as const) } satisfies WillEngine;
+    const second = { decide: vi.fn(async () => "trigger" as const) } satisfies WillEngine;
+    const lowerPriority = { decide: vi.fn(async () => "wait" as const) } satisfies WillEngine;
+    agents.will(new TestWillPlugin(10, true, first));
+    agents.will(new TestWillPlugin(10, true, second));
+    agents.will(new TestWillPlugin(5, true, lowerPriority));
+
+    await expect(agents.setupWill(scope)).resolves.toBe(lowerPriority);
+  });
+
+  it("uses the fixed stateless Core default when no Will plugin matches", async () => {
+    const agents = new Agents();
+    const willEngine = await agents.setupWill(scope);
+    const directWillEngine = await agents.setupWill(directScope);
+
+    expect(willEngine.decide(message(1), { activeTurnId: null })).toBe("trigger");
+    expect(willEngine.decide(message(0, [h("at", { id: "bot-1" })]), { activeTurnId: null })).toBe("trigger");
+    expect(willEngine.decide(message(0), { activeTurnId: null })).toBe("wait");
+    expect(directWillEngine.decide(message(0), { activeTurnId: null })).toBe("wait");
+    expect(Object.keys(willEngine)).toEqual(["decide", "debug"]);
+    expect(willEngine.debug?.()).toMatchObject({ engine: "default" });
+  });
+});

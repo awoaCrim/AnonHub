@@ -1,0 +1,59 @@
+name: 问题反馈
+description: 运行出错，或结果和预期不符
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望的结果
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: 部署方式
+      options:
+        - Linux + Docker
+        - Windows 本地运行时
+        - 源码运行
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      multiple: true
+      options:
+        - QQ
+        - 微信
+        - 网页聊天
+        - 控制台
+  - type: input
+    id: commit
+    attributes:
+      label: 版本
+      placeholder: 提交号，例如 79fd488b
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 去掉 API Key、密码、QQ 号和聊天内容后再贴。
+      render: shell

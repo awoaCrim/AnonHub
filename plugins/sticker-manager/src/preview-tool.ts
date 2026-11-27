@@ -1,0 +1,209 @@
+import type { AgentTool, EphemeralImageProjectionStore } from "@yesimbot/agent-runtime";
+import { contentHash as hashBytes, type ToolFailure } from "@yesimbot/foundation";
+import { firstFrameToPng, type ImagePreviewCapability, type ImagePreviewFrame } from "koishi-plugin-yesimbot/kernel";
+import { z } from "zod/v4";
+
+import { stickerFailure } from "./errors.js";
+import { detectImageMediaType } from "./files.js";
+import { sampleGifFrames, staticFrameToPng } from "./frames.js";
+import type { StickerPreviewGate } from "./preview-evidence.js";
+import type { StickerStore } from "./store.js";
+import { pickBestTaggedSticker } from "./tag-selection.js";
+import { tagModeInput, type StickerConfig } from "./types.js";
+
+export const STICKER_PREVIEW_MAX_FRAMES = 6;
+const MAX_PREVIEW_BYTES = 5 * 1024 * 1024;
+
+export type StickerPreviewResult =
+  | {
+      ok: true;
+      previewed: true;
+      id: string;
+      contentHash: string;
+      mode: "native" | "description";
+      category: string;
+      mime: string;
+      frameCount: number;
+      totalFrames: number;
+      sampled: boolean;
+      frames: string[];
+      description?: string;
+      message: string;
+    }
+  | ToolFailure;
+
+export interface StickerPreviewToolOptions {
+  readonly store: StickerStore;
+  readonly config: StickerConfig;
+  readonly scopeKey: string;
+  readonly projection: EphemeralImageProjectionStore;
+  readonly previewCapability: ImagePreviewCapability | undefined;
+  readonly gate: StickerPreviewGate;
+  readonly captureTurn?: (turnId: string) => () => boolean;
+}
+
+/** Selection is read-only and resolves once; send never re-randomizes the chosen target. */
+export function createStickerPreviewTool(options: StickerPreviewToolOptions): AgentTool<z.infer<ReturnType<typeof previewInputSchema>>, StickerPreviewResult> {
+  const { store, config, scopeKey, projection, previewCapability, gate } = options;
+  return {
+    name: "sticker_preview",
+    description: [
+      "查看已有表情包的实际画面；分类、标签和搜索结果仅为元数据。",
+      "可传精确 sticker_id，或按 category/index/tags 选择；不传参数随机挑选供查看。",
+      "返回画面或视觉描述及精确 ID，可用于 send_message 的 sticker parts；预览不是发送前置条件。",
+      "只查看，不发送或增加使用次数；动图采样帧不能代表完整动画。",
+    ].join("\n"),
+    inputSchema: tagModeInput(previewInputSchema(), config),
+    execute: async ({ sticker_id, category, index, tags }, execution) => {
+      const current = options.captureTurn?.(execution.turnId) ?? (() => true);
+      if (!current()) return stickerFailure("sticker_capability_retired");
+      const ticket = gate.begin(execution.turnId);
+      projection.clear(execution.toolCallId);
+      if (execution.abortSignal?.aborted) return stickerFailure("request_aborted");
+      if (!previewCapability || previewCapability.mode === "unavailable") return stickerFailure("sticker_image_input_unavailable");
+      try {
+        const sticker = sticker_id
+          ? await store.get(scopeKey, sticker_id)
+          : index !== undefined
+            ? await indexedSticker(store, scopeKey, category, index)
+            : tags?.length && config.tagMode
+              ? await pickBestTaggedSticker(store, scopeKey, tags, category)
+              : await store.random(scopeKey, category);
+        if (!sticker) return stickerFailure("sticker_not_found");
+        if (sticker.size > MAX_PREVIEW_BYTES) return stickerFailure("sticker_preview_too_large");
+        const bytes = await store.readBytes(sticker);
+        if (execution.abortSignal?.aborted) return stickerFailure("request_aborted");
+        if (bytes.byteLength > MAX_PREVIEW_BYTES) return stickerFailure("sticker_preview_too_large");
+        const mediaType = detectImageMediaType(bytes);
+        if (!mediaType) return stickerFailure("sticker_preview_unavailable");
+        const contentHash = hashBytes(bytes);
+        const preview = buildFrames(bytes, mediaType);
+        if (!preview || preview.frames.reduce((n, frame) => n + frame.bytes.byteLength, 0) > MAX_PREVIEW_BYTES) {
+          return stickerFailure("sticker_preview_unavailable");
+        }
+        let description: string | undefined;
+        if (previewCapability.mode === "native") {
+          const show = (frames: ImagePreviewFrame[]) =>
+            previewCapability.preview({ toolCallId: execution.toolCallId, turnId: execution.turnId, frames, signal: execution.abortSignal });
+          let outcome = show(preview.frames);
+          // A route that refuses WebP (Gemini via the gateway takes PNG and JPEG) still sees its first frame.
+          if (outcome.mode !== "native" && outcome.error === "image_input_unavailable" && mediaType === "image/webp") {
+            const still = await firstFrameToPng(bytes, "image/webp", { maxBytes: MAX_PREVIEW_BYTES, timeoutMs: 10_000, signal: execution.abortSignal });
+            if (still) outcome = show([{ bytes: still, mediaType: "image/png", label: "WebP 第一帧（转成了 PNG，动画后面的画面没有看到）" }]);
+          }
+          if (outcome.mode !== "native") {
+            return stickerFailure(outcome.error === "resource_read_aborted" ? "request_aborted" : "sticker_image_input_unavailable");
+          }
+        } else {
+          description = await previewCapability.describe({
+            frames: preview.frames,
+            question: "请读出清晰可见的文字、描述角色动作和表情，再说明可能表达的情绪；只描述提供的画面，采样帧以外的动作无法确认。",
+            signal: execution.abortSignal,
+          });
+          if (!description?.trim()) return stickerFailure("sticker_preview_unavailable");
+        }
+        if (!current()) return stickerFailure("sticker_capability_retired");
+        const mode = description ? ("description" as const) : ("native" as const);
+        if (
+          !gate.record(
+            execution.turnId,
+            { stickerId: sticker.id, contentHash, mediaType, mode, toolCallId: execution.toolCallId },
+            ticket,
+            execution.abortSignal,
+          )
+        ) {
+          projection.clear(execution.toolCallId);
+          return stickerFailure("request_aborted");
+        }
+        // Capture the exact content the model just saw, so a later cleanup or preview cannot revive
+        // a stale candidate and the expression owner receives the same bounded evidence.
+        const retained = gate.recordSnapshot(
+          execution.turnId,
+          {
+            stickerId: sticker.id,
+            contentHash,
+            mediaType,
+            mode,
+            frames: preview.frames.map((frame) => ({ bytes: frame.bytes, mediaType: frame.mediaType, label: frame.label })),
+            ...(description ? { description } : {}),
+          },
+          ticket,
+          execution.abortSignal,
+        );
+        if (!retained) {
+          projection.clear(execution.toolCallId);
+          return stickerFailure("request_aborted");
+        }
+        return {
+          ok: true,
+          previewed: true,
+          id: sticker.id,
+          contentHash,
+          mode,
+          category: sticker.category,
+          // Echo the authorized selector so a resume matches this exact completed call/result.
+          requested: { ...(sticker_id ? { sticker_id } : {}), ...(category ? { category } : {}), ...(index === undefined ? {} : { index }) },
+          mime: mediaType,
+          frameCount: preview.frames.length,
+          totalFrames: preview.totalFrames,
+          sampled: preview.frames.length < preview.totalFrames,
+          frames: preview.frames.map((frame) => frame.label),
+          ...(description ? { description } : {}),
+          message: "请根据提供的画面/描述判断是否适合当前语境；需要发送时使用本结果的 id。采样不代表完整动画。",
+        };
+      } catch {
+        return stickerFailure(execution.abortSignal?.aborted ? "request_aborted" : "sticker_preview_unavailable");
+      }
+    },
+    toModelOutput: ({ toolCallId, output }) => {
+      if (!output.ok) return { type: "json", value: { ...output, error: { ...output.error } } };
+      if (output.mode !== "native") return { type: "json", value: output };
+      const frames = projection.getFrames(toolCallId);
+      if (!frames.length) {
+        const expired = stickerFailure("sticker_preview_expired");
+        return { type: "json", value: { ...expired, error: { ...expired.error } } };
+      }
+      return {
+        type: "content",
+        value: [
+          { type: "text", text: JSON.stringify(output) },
+          ...frames.map((frame) => ({ type: "image-data" as const, data: Buffer.from(frame.bytes).toString("base64"), mediaType: frame.mediaType })),
+        ],
+      };
+    },
+  };
+}
+
+function previewInputSchema() {
+  return z
+    .object({
+      sticker_id: z.string().optional().describe("sticker_search 返回的精确 id"),
+      category: z.string().optional().describe("已有分类完整名称；仅传分类时随机选择候选供查看"),
+      index: z.number().int().min(1).optional().describe("分类内 1-based 序号"),
+      tags: z.array(z.string()).max(5).optional().describe("按标签选择候选"),
+    })
+    .strict();
+}
+
+async function indexedSticker(store: StickerStore, scopeKey: string, category: string | undefined, index: number) {
+  const stickers = category
+    ? await store.listCategory(scopeKey, category)
+    : (await store.listByScopeKey(scopeKey)).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  return stickers[index - 1];
+}
+
+function buildFrames(bytes: Uint8Array, mediaType: string): { frames: ImagePreviewFrame[]; totalFrames: number } | undefined {
+  if (mediaType === "image/gif") {
+    const sampling = sampleGifFrames(bytes, { maxFrames: STICKER_PREVIEW_MAX_FRAMES });
+    return (
+      sampling && {
+        frames: sampling.samples.map((sample) => ({ ...sample.png, label: `frame ${sample.index + 1}/${sampling.totalFrames}, ${sample.timeMs}ms` })),
+        totalFrames: sampling.totalFrames,
+      }
+    );
+  }
+  // Most routes take WebP as it is; one that refuses it gets the first frame as PNG (see the preview above).
+  if (mediaType === "image/webp") return { frames: [{ bytes, mediaType, label: "WebP 画面（若为动画，不保证所有帧可见）" }], totalFrames: 1 };
+  const still = staticFrameToPng(bytes, mediaType);
+  return still && { frames: [{ ...still, label: "静态画面" }], totalFrames: 1 };
+}

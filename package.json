@@ -1,0 +1,65 @@
+{
+  "name": "@root/yesimbot",
+  "private": true,
+  "description": "让大语言模型以角色身份加入 QQ、微信和网页里的群聊与私聊",
+  "homepage": "https://github.com/awoaCrim/AnonHub#readme",
+  "license": "MIT",
+  "contributors": [
+    "HydroGest <2445691453@qq.com>",
+    "Dispure <3116716016@qq.com>",
+    "MiaowFISH <1293865264@qq.com>",
+    "Touch-Night <1762918301@qq.com>"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/awoaCrim/AnonHub.git"
+  },
+  "workspaces": [
+    "apps/*",
+    "core",
+    "packages/*",
+    "platforms/*",
+    "plugins/*",
+    "providers/*",
+    "docker/app"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "check-types": "turbo run check-types",
+    "clean": "turbo run clean && rimraf .turbo",
+    "conventions": "node scripts/conventions-report.mjs",
+    "device:pack": "node scripts/package-device-client.mjs",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check .",
+    "lint": "oxlint .",
+    "lint:fix": "oxlint --fix .",
+    "prepare": "husky",
+    "pub": "turbo run pub",
+    "server": "node apps/server/dist/main.js",
+    "test": "turbo run test"
+  },
+  "devDependencies": {
+    "@stylistic/eslint-plugin": "^5.10.0",
+    "@types/node": "^22.16.2",
+    "bumpp": "^10.2.0",
+    "esbuild": "0.25.12",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "oxfmt": "^0.62.0",
+    "oxlint": "^1.77.0",
+    "pkgroll": "^2.27.1",
+    "rimraf": "^6.1.2",
+    "turbo": "2.10.8",
+    "typescript": "^5.9.3"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,mjs,cjs,js,jsx}": [
+      "oxlint --fix",
+      "oxfmt --write"
+    ],
+    "*.json": [
+      "oxfmt --write"
+    ]
+  },
+  "packageManager": "yarn@4.12.0"
+}

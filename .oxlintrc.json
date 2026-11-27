@@ -1,0 +1,250 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint", "import", "node", "oxc", "promise", "typescript", "vitest", "vue"],
+  "jsPlugins": ["@stylistic/eslint-plugin", "./tools/eslint-plugin-declaration-order.mjs", "./tools/eslint-plugin-conventions.mjs"],
+  "rules": {
+    "@typescript-eslint/no-explicit-any": "error",
+    "declaration-order/module-declaration-order": "warn",
+    "@stylistic/padding-line-between-statements": [
+      "warn",
+      {
+        "blankLine": "always",
+        "prev": ["type", "interface", "function", "export"],
+        "next": ["type", "interface", "function", "export"]
+      }
+    ],
+    "vitest/require-mock-type-parameters": "off",
+    "vitest/require-to-throw-message": "off",
+    "vitest/no-conditional-expect": "off",
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "koishi",
+            "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+          },
+          {
+            "name": "schemastery",
+            "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+          },
+          {
+            "name": "cordis",
+            "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+          },
+          {
+            "name": "koishi-plugin-adapter-onebot",
+            "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+          },
+          {
+            "name": "minato",
+            "message": "存储用 @yesimbot/foundation 的共用 SQLite（规范 08）。"
+          }
+        ],
+        "patterns": [
+          {
+            "group": ["@koishijs/*", "@satorijs/*", "@cordisjs/*"],
+            "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+          }
+        ]
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["*.test.ts", "*.spec.ts", "tests/**/*.ts"],
+      "rules": {
+        "declaration-order/module-declaration-order": "off"
+      }
+    },
+    {
+      "files": ["apps/*/src/**", "core/src/**", "packages/*/src/**", "platforms/*/src/**", "plugins/*/src/**", "providers/*/src/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "koishi",
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              },
+              {
+                "name": "schemastery",
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              },
+              {
+                "name": "cordis",
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              },
+              {
+                "name": "koishi-plugin-adapter-onebot",
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              },
+              {
+                "name": "minato",
+                "message": "存储用 @yesimbot/foundation 的共用 SQLite（规范 08）。"
+              },
+              {
+                "name": "node:fs/promises",
+                "importNames": ["rename", "realpath"],
+                "message": "原子写和路径检查用 @yesimbot/foundation 的 writeFileAtomic / resolveInside（规范 03）。"
+              },
+              {
+                "name": "fs/promises",
+                "importNames": ["rename", "realpath"],
+                "message": "原子写和路径检查用 @yesimbot/foundation 的 writeFileAtomic / resolveInside（规范 03）。"
+              },
+              {
+                "name": "node:fs",
+                "importNames": ["renameSync", "realpathSync"],
+                "message": "原子写和路径检查用 @yesimbot/foundation 的 writeFileAtomic / resolveInside（规范 03）。"
+              },
+              {
+                "name": "node:crypto",
+                "importNames": ["randomBytes", "timingSafeEqual"],
+                "message": "令牌和比较用 @yesimbot/foundation 的 newSecret / safeEqual（规范 04）。"
+              },
+              {
+                "name": "crypto",
+                "importNames": ["randomBytes", "timingSafeEqual"],
+                "message": "令牌和比较用 @yesimbot/foundation 的 newSecret / safeEqual（规范 04）。"
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["@koishijs/*", "@satorijs/*", "@cordisjs/*"],
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              }
+            ]
+          }
+        ],
+        "no-restricted-globals": [
+          "error",
+          {
+            "name": "fetch",
+            "message": "出网请求走 @yesimbot/foundation 的 httpFetch 并声明用途（规范 05）。"
+          }
+        ],
+        "no-restricted-properties": [
+          "error",
+          {
+            "object": "Date",
+            "property": "now",
+            "message": "时间从 Clock 拿（规范 06）。"
+          },
+          {
+            "property": "toLocaleString",
+            "message": "给模型看的时间用 formatForModel，时区来自配置（规范 06）。"
+          },
+          {
+            "property": "toLocaleDateString",
+            "message": "给模型看的时间用 formatForModel，时区来自配置（规范 06）。"
+          },
+          {
+            "property": "toLocaleTimeString",
+            "message": "给模型看的时间用 formatForModel，时区来自配置（规范 06）。"
+          },
+          {
+            "object": "fs",
+            "property": "rename",
+            "message": "原子写和路径检查用 @yesimbot/foundation 的 writeFileAtomic / resolveInside（规范 03）。"
+          },
+          {
+            "object": "fs",
+            "property": "realpath",
+            "message": "原子写和路径检查用 @yesimbot/foundation 的 writeFileAtomic / resolveInside（规范 03）。"
+          },
+          {
+            "object": "fs",
+            "property": "renameSync",
+            "message": "原子写和路径检查用 @yesimbot/foundation 的 writeFileAtomic / resolveInside（规范 03）。"
+          },
+          {
+            "object": "fs",
+            "property": "realpathSync",
+            "message": "原子写和路径检查用 @yesimbot/foundation 的 writeFileAtomic / resolveInside（规范 03）。"
+          },
+          {
+            "object": "crypto",
+            "property": "randomBytes",
+            "message": "令牌和比较用 @yesimbot/foundation 的 newSecret / safeEqual（规范 04）。"
+          },
+          {
+            "object": "crypto",
+            "property": "timingSafeEqual",
+            "message": "令牌和比较用 @yesimbot/foundation 的 newSecret / safeEqual（规范 04）。"
+          }
+        ],
+        "no-console": "error",
+        "preserve-caught-error": "error",
+        "no-throw-literal": "error",
+        "import/no-cycle": "error",
+        "conventions/no-platform-literal": "error"
+      }
+    },
+    {
+      "files": ["packages/device-client/src/**"],
+      "rules": {
+        "no-restricted-globals": "off"
+      }
+    },
+    {
+      "files": ["platforms/*/src/**", "plugins/wechat-bridge/src/**", "packages/contracts/src/**"],
+      "rules": {
+        "conventions/no-platform-literal": "off"
+      }
+    },
+    {
+      "files": ["packages/foundation/src/**", "packages/e2e/src/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "koishi",
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              },
+              {
+                "name": "schemastery",
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              },
+              {
+                "name": "cordis",
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              },
+              {
+                "name": "koishi-plugin-adapter-onebot",
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              },
+              {
+                "name": "minato",
+                "message": "存储用 @yesimbot/foundation 的共用 SQLite（规范 08）。"
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["@koishijs/*", "@satorijs/*", "@cordisjs/*"],
+                "message": "Koishi 已删除（leave-koishi 第 8 阶段）：不 import Koishi / Satori / Cordis 系的包（规范 09、10）。"
+              }
+            ]
+          }
+        ],
+        "no-restricted-globals": "off",
+        "no-restricted-properties": "off",
+        "no-console": "off",
+        "preserve-caught-error": "off",
+        "no-throw-literal": "off",
+        "import/no-cycle": "off"
+      }
+    }
+  ],
+  "settings": {
+    "vitest": {
+      "typecheck": true
+    }
+  },
+  "env": {
+    "builtin": true
+  }
+}

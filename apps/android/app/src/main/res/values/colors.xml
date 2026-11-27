@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The console's bg, text and accent tokens (plugins/console/web/src/styles/theme.css), shown until the page reports its own. -->
+<resources>
+    <color name="page">#ffffff</color>
+    <color name="text">#181818</color>
+    <color name="accent">#181818</color>
+</resources>
