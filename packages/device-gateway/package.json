@@ -25,7 +25,7 @@
     "@yesimbot/contracts": "workspace:^",
     "@yesimbot/device-store": "workspace:^",
     "@yesimbot/foundation": "workspace:^",
-    "ws": "^8.18.0"
+    "ws": "^8.23.0"
   },
   "devDependencies": {
     "@types/ws": "^8.18.1",
