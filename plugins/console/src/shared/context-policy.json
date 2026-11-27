@@ -1,0 +1,8 @@
+{
+  "archive": {
+    "maxKB": ["number", 5120, 0]
+  },
+  "magicContext": {
+    "triggerTokens": ["integer", null, 8000]
+  }
+}

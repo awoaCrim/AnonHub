@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The tile: plain black (user, 2026-11-26: 「logo也改成黑白的」). Same drawing as the web icons (plugins/console/web/public). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="908"
+    android:viewportHeight="908">
+    <path android:pathData="M0,0h908v908h-908z" android:fillColor="#FF181818" />
+</vector>

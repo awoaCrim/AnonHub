@@ -1,0 +1,23 @@
+{
+  "name": "@yesimbot/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "@yesimbot/server": "workspace:^",
+    "koishi-plugin-adapter-wechat-bridge": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "koishi-plugin-yesimbot-console": "workspace:^",
+    "koishi-plugin-yesimbot-model-provider": "workspace:^",
+    "vitest": "^4.0.18",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "yesimbot-extension-hello",
+  "version": "1.2.0",
+  "type": "module",
+  "exports": {
+    "./extension": "./extension.js"
+  },
+  "peerDependencies": {
+    "zod": "*"
+  }
+}

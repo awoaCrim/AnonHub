@@ -1,0 +1,250 @@
+/* Shared shadcn theme tokens and document defaults; no component skins. */
+/* YesImBot WebUI design system. Pages compose these primitives; page styles only lay out. */
+/*
+ * Black and white (user, 2026-11-26: 「不要橙色，我需要那种简约的黑白色」, with the 前端界面设计规范 of the same day):
+ * neutral greys everywhere, black as the one accent (white in dark), two text tones, red kept for errors only.
+ */
+:root {
+  color-scheme: light;
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f5f5f5;
+  --surface-3: #ebebeb;
+  --sidebar: #ffffff;
+  --text: #181818;
+  --text-2: #6a6a6a;
+  --text-3: #6a6a6a;
+  --line: #ebebeb;
+  --line-strong: #d4d4d4;
+  --accent: #181818;
+  --accent-solid: #181818;
+  --accent-soft: #f0f0f0;
+  --accent-text: #181818;
+  --ring: rgb(24 24 24 / 14%);
+  --ok: #181818;
+  --ok-soft: #f5f5f5;
+  --warn: #181818;
+  --warn-soft: #f5f5f5;
+  --danger: #c42b1c;
+  --danger-soft: #fdf1f0;
+  --shadow: none;
+  --shadow-lg: 0 8px 32px rgb(0 0 0 / 10%);
+  --scrim: rgb(0 0 0 / 32%);
+  --on-accent: #ffffff;
+  --code-bg: #f5f5f5;
+  --code-text: #181818;
+  /* Chat: both sides in the same grey bubble; the side tells them apart (user, 2026-11-26: 「bot的正常对话消息还是需要气泡的」). */
+  --bubble-bot: #f0f0f0;
+  --bubble-user: #f0f0f0;
+  --composer-border: #e5e5e5;
+  --composer-shadow: 0 4px 16px rgb(0 0 0 / 4%);
+  /* The sliding thumb of a segmented switch, on its grey track. */
+  --control-thumb: #ffffff;
+  /* Grouped settings: rows on one filled surface, set apart by space, icons straight on it. */
+  --group: #f5f5f5;
+  --group-hover: #f5f5f5;
+  --group-line: transparent;
+  --group-tile: #f5f5f5;
+  --quote-border: #d4d4d4;
+  --radius: 12px;
+  --radius-sm: 8px;
+  /* Motion: one easing family and three lengths, so everything moves alike. */
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-panel: cubic-bezier(0.32, 0.72, 0, 1);
+  --t-fast: 0.15s;
+  --t-mid: 0.24s;
+  --t-slow: 0.32s;
+  --sidebar-width: 232px;
+  --rail-width: 64px;
+  --control-h: 36px;
+  /* Geist everywhere; Chinese falls back to the system's own face. */
+  --font: "Geist Variable", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --serif: var(--font);
+  --mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111111;
+    --surface: #191919;
+    --surface-2: #1f1f1f;
+    --surface-3: #2a2a2a;
+    --sidebar: #111111;
+    --text: #ededed;
+    --text-2: #a0a0a0;
+    --text-3: #a0a0a0;
+    --line: #262626;
+    --line-strong: #3a3a3a;
+    --accent: #ededed;
+    --accent-solid: #ededed;
+    --accent-soft: #262626;
+    --accent-text: #ededed;
+    --ring: rgb(237 237 237 / 20%);
+    --ok: #ededed;
+    --ok-soft: #1f1f1f;
+    --warn: #ededed;
+    --warn-soft: #1f1f1f;
+    --danger: #f28b82;
+    --danger-soft: #2a1714;
+    --shadow: none;
+    --shadow-lg: 0 8px 32px rgb(0 0 0 / 50%);
+    --scrim: rgb(0 0 0 / 60%);
+    --code-bg: #1f1f1f;
+    --code-text: #ededed;
+    --bubble-bot: #262626;
+    --bubble-user: #262626;
+    --composer-border: #2a2a2a;
+    --composer-shadow: 0 4px 16px rgb(0 0 0 / 40%);
+    --control-thumb: #333333;
+    --group: #191919;
+    --group-hover: #1f1f1f;
+    --group-line: transparent;
+    --group-tile: #1f1f1f;
+    --quote-border: #3a3a3a;
+    --on-accent: #111111;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111111;
+  --surface: #191919;
+  --surface-2: #1f1f1f;
+  --surface-3: #2a2a2a;
+  --sidebar: #111111;
+  --text: #ededed;
+  --text-2: #a0a0a0;
+  --text-3: #a0a0a0;
+  --line: #262626;
+  --line-strong: #3a3a3a;
+  --accent: #ededed;
+  --accent-solid: #ededed;
+  --accent-soft: #262626;
+  --accent-text: #ededed;
+  --ring: rgb(237 237 237 / 20%);
+  --ok: #ededed;
+  --ok-soft: #1f1f1f;
+  --warn: #ededed;
+  --warn-soft: #1f1f1f;
+  --danger: #f28b82;
+  --danger-soft: #2a1714;
+  --shadow: none;
+  --shadow-lg: 0 8px 32px rgb(0 0 0 / 50%);
+  --scrim: rgb(0 0 0 / 60%);
+  --code-bg: #1f1f1f;
+  --code-text: #ededed;
+  --bubble-bot: #262626;
+  --bubble-user: #262626;
+  --composer-border: #2a2a2a;
+  --composer-shadow: 0 4px 16px rgb(0 0 0 / 40%);
+  --control-thumb: #333333;
+  --group: #191919;
+  --group-hover: #1f1f1f;
+  --group-line: transparent;
+  --group-tile: #1f1f1f;
+  --quote-border: #3a3a3a;
+  --on-accent: #111111;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* Keep document, directory, editor and horizontal scrollbars equally compact. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 var(--font);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* A field the browser filled in (saved login) keeps its own colours instead of Chrome's light blue: the browser's
+   background is applied through a transition that never finishes. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--text);
+  caret-color: var(--text);
+  transition: background-color 9999s ease-out 0s;
+}
+
+a {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  line-height: 1.3;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+p {
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+input[type="checkbox"],
+input[type="radio"],
+input[type="range"],
+progress {
+  accent-color: var(--accent-solid);
+}
+
+/* Every control eases between states (hover, press, selection, theme) unless it sets its own transition. */
+:where(a, button, input, select, textarea, summary, [role="button"], [role="tab"], [role="option"], [role="menuitem"]) {
+  transition:
+    color var(--t-fast) ease,
+    background-color var(--t-fast) ease,
+    border-color var(--t-fast) ease,
+    box-shadow var(--t-fast) ease,
+    opacity var(--t-fast) ease,
+    scale var(--t-fast) ease;
+}
+
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

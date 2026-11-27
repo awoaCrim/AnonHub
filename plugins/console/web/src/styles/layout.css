@@ -1,0 +1,526 @@
+/* UI-EXCEPTION composition-layout: app shell, settings rows and data-reading layouts have no drop-in shadcn component. Primitive visuals are owned by components/ui; see UI-MIGRATION.md. */
+.field {
+  @apply text-sm font-medium text-foreground;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+}
+.field > small,
+.hint {
+  @apply text-xs font-normal text-muted-foreground;
+}
+.search {
+  position: relative;
+  display: block;
+}
+.search .input,
+.search .control {
+  padding-left: 40px;
+}
+.search::before {
+  @apply text-muted-foreground;
+  content: "";
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  width: 20px;
+  height: 20px;
+  transform: translateY(-50%);
+  background: currentColor;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none'%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M11.5 2.75C6.66751 2.75 2.75 6.66751 2.75 11.5C2.75 16.3325 6.66751 20.25 11.5 20.25C16.3325 20.25 20.25 16.3325 20.25 11.5C20.25 6.66751 16.3325 2.75 11.5 2.75ZM1.25 11.5C1.25 5.83908 5.83908 1.25 11.5 1.25C17.1609 1.25 21.75 5.83908 21.75 11.5C21.75 14.0605 20.8111 16.4017 19.2589 18.1982L22.5303 21.4697C22.8232 21.7626 22.8232 22.2374 22.5303 22.5303C22.2374 22.8232 21.7626 22.8232 21.4697 22.5303L18.1982 19.2589C16.4017 20.8111 14.0605 21.75 11.5 21.75C5.83908 21.75 1.25 17.1609 1.25 11.5Z' fill='black'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  pointer-events: none;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.card-head > * {
+  min-width: 0;
+  max-width: 100%;
+}
+.card-head > .toolbar {
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+/* Every card's head looks the same: title, one line under it, actions on the right; a rule, no tint. */
+.card.flush > .card-head {
+  @apply border-b border-border;
+  margin: 0;
+  padding: 16px 20px 16px;
+}
+@media (max-width: 640px) {
+  .card.flush > .card-head {
+    padding-inline: 16px;
+  }
+}
+.card-head h2 {
+  @apply text-base font-semibold;
+}
+.card-head p {
+  @apply text-sm text-muted-foreground;
+  margin-top: 4px;
+}
+
+/* Strip: one card split into equal cells by hairlines (stats, facts). Set --cols for the column count. */
+.strip {
+  @apply bg-border border border-border rounded-xl shadow-sm;
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 4), minmax(0, 1fr));
+  gap: 4px;
+  overflow: hidden;
+  min-width: 0;
+}
+.strip > * {
+  @apply bg-card;
+  padding: 16px 20px;
+  min-width: 0;
+}
+@media (max-width: 900px) {
+  .strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .strip > :last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+}
+
+/* ---------- Page layout ---------- */
+.page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+  min-width: 0;
+}
+/* Pages built from SettingsGroups: more air between the groups than between cards. */
+.page.grouped {
+  gap: 40px;
+}
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px 20px;
+  flex-wrap: wrap;
+  padding-bottom: 4px;
+}
+.page-head h1 {
+  @apply font-sans text-2xl font-semibold;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+.page-head p {
+  @apply text-muted-foreground text-sm;
+  margin-top: 8px;
+}
+.page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  min-width: 0;
+}
+@media (max-width: 1100px) {
+  .grid-3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 720px) {
+  .grid-3 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.stack {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.spacer {
+  flex: 1;
+}
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.toolbar .search {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+/* Settings: rows with text on the left and the control on the right; stacked under 640px.
+   <div class="settings"><label class="setting"><span class="setting-text"><strong/><small/></span><span class="setting-control">…</span></label></div> */
+.settings {
+  display: grid;
+  min-width: 0;
+}
+.setting {
+  @apply border-t border-border;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 300px);
+  align-items: center;
+  gap: 8px 32px;
+  padding: 16px 0;
+  min-width: 0;
+  position: relative;
+}
+.setting:first-child {
+  border-top: 0;
+  padding-top: 4px;
+}
+.setting:last-child {
+  padding-bottom: 4px;
+}
+.setting-text {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.setting-text strong {
+  @apply text-sm font-semibold;
+}
+.setting-text small {
+  @apply text-sm text-muted-foreground;
+  line-height: 1.55;
+}
+.setting-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+@media (max-width: 640px) {
+  .setting {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .setting-control {
+    justify-content: flex-start;
+  }
+  /* Switches stay beside their text. */
+  .setting:has(> .setting-control > [data-slot="switch"]) {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+}
+
+/* ---------- Data display ---------- */
+/* Top-aligned, so a number with a unit line under it sits level with one without. */
+.stat {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-width: 0;
+}
+.stat-label {
+  @apply text-xs font-medium text-muted-foreground;
+}
+.stat-value {
+  @apply text-3xl font-semibold;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.stat-meta {
+  @apply text-xs text-muted-foreground;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.kv {
+  @apply text-sm;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 20px;
+  margin: 0;
+}
+.kv dt {
+  @apply text-muted-foreground;
+}
+.kv dd {
+  @apply text-foreground;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+/* Facts: labelled values in an auto-filling grid (<dl class="facts"><div><dt/><dd/></div></dl>). */
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 16px 24px;
+  margin: 0;
+}
+.facts dt {
+  @apply text-xs text-muted-foreground;
+}
+.facts dd {
+  @apply text-sm;
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 640px) {
+  .table.cards thead {
+    display: none;
+  }
+  .table.cards,
+  .table.cards tbody,
+  .table.cards tr,
+  .table.cards td {
+    display: block;
+    width: 100%;
+  }
+  .table.cards tr {
+    @apply border-b border-border;
+    padding: 12px 16px;
+  }
+  .table.cards td {
+    @apply border-0;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 4px 0;
+    text-align: right;
+  }
+  .table.cards td::before {
+    @apply text-muted-foreground;
+    content: attr(data-label);
+    text-align: left;
+    flex: none;
+  }
+  .table.cards tbody tr:hover td {
+    @apply bg-transparent;
+  }
+}
+.list {
+  display: grid;
+  min-width: 0;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.dot {
+  @apply rounded-full;
+  width: 7px;
+  height: 7px;
+  background: currentColor;
+  flex: none;
+}
+.dot.ok {
+  @apply text-ok;
+}
+.dot.warn {
+  @apply text-warn;
+}
+.dot.danger {
+  @apply text-destructive;
+}
+.dot.idle {
+  @apply text-muted-foreground;
+}
+
+.empty-state {
+  @apply text-muted-foreground text-sm;
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 36px 16px;
+  text-align: center;
+}
+.empty-state h2,
+.empty-state h3 {
+  @apply font-sans text-base font-medium text-foreground;
+}
+
+.mono {
+  @apply font-mono text-xs;
+}
+/* A form field holding an ID or a model name; same height as the 14px fields beside it. */
+.mono-input {
+  @apply font-mono text-sm;
+  line-height: 22.4px;
+}
+.muted {
+  @apply text-muted-foreground;
+}
+/* Takes the remaining room in a flex row (status text before buttons, a title before a badge). */
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* A tappable side-list row (tasks, plans): a round icon, a title of up to two lines and a quiet line under it. */
+.side-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  min-height: 56px;
+  padding: 8px;
+  border-radius: 14px;
+  text-align: left;
+  transition: background-color var(--t-fast) ease;
+}
+.side-row:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+.side-row:active:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+.side-row:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.side-row-icon {
+  @apply text-muted-foreground;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  border-radius: 999px;
+}
+.side-row-title {
+  @apply text-foreground;
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
+  /* Long paths, commands and URLs wrap instead of widening the list. */
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.side-row-meta {
+  @apply text-xs text-muted-foreground;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* Content that has just loaded or appeared: a short fade and rise. A list lets its first rows follow one another. */
+@keyframes arrive {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+.arrive,
+.arrive-list > * {
+  animation: arrive var(--t-mid) var(--ease-out) both;
+}
+.arrive-list > :nth-child(2) {
+  animation-delay: 40ms;
+}
+.arrive-list > :nth-child(3) {
+  animation-delay: 80ms;
+}
+.arrive-list > :nth-child(n + 4) {
+  animation-delay: 120ms;
+}
+
+/* Every page shares the chat's motion (user, 2026-11-20: 「其他页面也要和对话页面一样的标准」): cards and empty
+   states arrive the way loaded chat content does, cards in a column one after another, and a button gives a
+   little under the pointer. Cards are keyed by stable identity, so updates patch them without replaying this.
+   The press uses `scale`, which composes with a button's own `transform` (a centred floating button keeps its place). */
+[data-slot="card"],
+.empty-state {
+  animation: arrive var(--t-mid) var(--ease-out) both;
+}
+[data-slot="card"] + [data-slot="card"] {
+  animation-delay: 40ms;
+}
+[data-slot="card"] + [data-slot="card"] + [data-slot="card"] {
+  animation-delay: 80ms;
+}
+[data-slot="card"] + [data-slot="card"] + [data-slot="card"] + [data-slot="card"] {
+  animation-delay: 120ms;
+}
+[data-slot="button"]:active:not(:disabled, [aria-disabled="true"]) {
+  scale: 0.97;
+}
+
+/* A loading note that fades in only if loading takes a moment, so a quick answer never flashes it. */
+@keyframes late-in {
+  to {
+    opacity: 1;
+  }
+}
+.late-in {
+  opacity: 0;
+  animation: late-in var(--t-mid) ease 0.25s forwards;
+}
+
+/* Page-level morphs (the computer's thumbnail growing into its screen): short, and easing out. */
+::view-transition-group(*) {
+  animation-duration: 0.24s;
+  animation-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
+  }
+}
+
+/* Keyboard users can reach the active workflow without traversing the whole sidebar. */
+.skip-link {
+  @apply rounded-md bg-card text-brand-text shadow-lg;
+  position: fixed;
+  left: 16px;
+  top: 12px;
+  z-index: 100;
+  padding: 12px 16px;
+  transform: translateY(-200%);
+}
+.skip-link:focus {
+  transform: translateY(0);
+}
+/* A list opening one of its items (and back): the content fades in and rises a little; title and sidebar stay. */
+.view-enter {
+  animation: view-in 0.15s ease-out;
+}
+@keyframes view-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}

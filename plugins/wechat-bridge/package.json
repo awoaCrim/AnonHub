@@ -1,0 +1,42 @@
+{
+  "name": "koishi-plugin-adapter-wechat-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.cjs"
+    },
+    "./connector": {
+      "types": "./dist/connector.d.ts",
+      "require": "./dist/connector.cjs",
+      "default": "./dist/connector.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "pkgroll --sourcemap=inline",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@yesimbot/foundation": "workspace:^",
+    "@yesimbot/wechat-transport": "workspace:^",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "vitest": "^4.0.18"
+  },
+  "peerDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^"
+  }
+}

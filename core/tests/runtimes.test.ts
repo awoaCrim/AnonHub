@@ -1,0 +1,2489 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type { ToolSet } from "ai";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const state = vi.hoisted(() => ({
+  active: null as string | null,
+  append: vi.fn(),
+  observeInput: vi.fn(),
+  send: vi.fn(),
+  run: vi.fn(),
+  decide: vi.fn(),
+  decideBatch: vi.fn(),
+  settleReservation: vi.fn(),
+  observe: vi.fn(),
+  wait: vi.fn(() => Promise.resolve()),
+}));
+
+vi.mock("@yesimbot/agent-runtime", async (original) => {
+  const actual = await original<typeof import("@yesimbot/agent-runtime")>();
+  return {
+    ...actual,
+    createAgent: vi.fn(() => ({
+      init: vi.fn(),
+      append: state.append,
+      observe: state.observeInput,
+      send: state.send,
+      run: state.run,
+      getActiveTurnId: () => state.active,
+      wait: state.wait,
+      interrupt: vi.fn(),
+      stop: vi.fn(),
+      isIdle: () => state.active === null,
+    })),
+  };
+});
+
+import { createAgent, createEntry, EphemeralImageProjectionStore } from "@yesimbot/agent-runtime";
+
+import { Agents } from "../src/agents/index.js";
+import { Channel, Channels, type ChannelContext } from "../src/channels/index.js";
+import type { Config } from "../src/config.js";
+import { MessageBatchRegistry, type MessageBatchInput, type MessageBatchPlugin } from "../src/message-batches/index.js";
+import { createMessage, type Event, type MessageRecord } from "../src/messages/index.js";
+import { ModelService } from "../src/models/index.js";
+import { ChannelRuntime } from "../src/runtimes/channel.js";
+import { resolveReadImagePolicy, Runtimes } from "../src/runtimes/index.js";
+import { createModelInputPlugin } from "../src/runtimes/model-input.js";
+import type { ChannelRuntimeOptions } from "../src/runtimes/types.js";
+import { PNG_BYTES, TestEvents, testAccount } from "./helpers/index.js";
+import { VIDEO_BYTES } from "./helpers/video.js";
+
+const config: Config = {
+  basePath: "/tmp",
+  chatModel: "test:model",
+  auxiliaryModel: undefined,
+  visionModel: undefined,
+  logLevel: 2,
+  allowedChannels: [],
+  imageInput: false,
+  modelRetries: 0,
+  resourceReadTimeout: 1,
+  pacing: { charactersPerSecond: 1, maxTotalDelayMs: 1 },
+  customInnerThought: true,
+  session: {
+    magicContext: {},
+    archive: { maxKB: 0 },
+  },
+};
+
+const event = {
+  eventType: "delivery.failed",
+  platform: "test",
+  selfId: "bot",
+  timestamp: 1,
+  channel: { id: "room", type: 0 },
+  text: "failure",
+  delivery: { turnId: "t", messageId: "m", segmentIndex: 0, segmentTotal: 1, error: { name: "Error", message: "x" } },
+} as const;
+
+const pokeEvent = {
+  eventType: "notice.poke",
+  platform: "test",
+  selfId: "bot",
+  timestamp: 2,
+  channel: { id: "room", type: 0 },
+  text: "typed poke",
+  actorId: "user-2",
+  targetId: "bot",
+  action: "拍了拍",
+} as never;
+
+function message(messageId: string, userId: string, timestamp: number): MessageRecord {
+  return {
+    platform: "test",
+    selfId: "bot",
+    timestamp,
+    channel: { id: "room", type: 0 },
+    user: { id: userId, name: userId },
+    messageId,
+    parts: [],
+  };
+}
+
+function batchPlugin(options: { acceptEvents?: boolean } = {}) {
+  let flush: ((messages: readonly import("../src/messages/index.js").Message[]) => Promise<void>) | undefined;
+  let flushInputs: ((inputs: readonly MessageBatchInput[]) => Promise<void>) | undefined;
+  const queuedEvents: Event[] = [];
+  const controller = {
+    enqueue: vi.fn(),
+    enqueueEvent: options.acceptEvents
+      ? vi.fn((input: Event) => {
+          queuedEvents.push(input);
+          return true;
+        })
+      : undefined,
+    stop: vi.fn(),
+  };
+  const plugin: MessageBatchPlugin = {
+    priority: 0,
+    match: () => true,
+    setup: vi.fn(async (_context, callback, extensions) => {
+      flush = callback;
+      flushInputs = extensions?.flushInputs;
+      return controller;
+    }),
+  };
+  return {
+    controller,
+    plugin,
+    queuedEvents,
+    flush: (messages: readonly import("../src/messages/index.js").Message[]) => flush!(messages),
+    flushInputs: (inputs: readonly MessageBatchInput[]) => flushInputs!(inputs),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Read image routing
+// ---------------------------------------------------------------------------
+
+describe("read image routing", () => {
+  const primary = (imageInput: boolean, imageToolResult: "native" | "unsupported" | "unknown", imageToolResultMediaTypes?: readonly string[]) =>
+    ({
+      entry: { modalities: imageInput ? { input: ["image"] } : undefined },
+      capabilities: { imageToolResult, ...(imageToolResultMediaTypes === undefined ? {} : { imageToolResultMediaTypes }) },
+      model: { id: "primary" },
+    }) as never;
+  const vision = () => ({ entry: { modalities: { input: ["image"] } }, model: { id: "vision" } }) as never;
+
+  it("uses native projection only when config, model, and transport all allow it", () => {
+    expect(resolveReadImagePolicy(primary(true, "native"), vision(), true)).toMatchObject({ mode: "native" });
+  });
+
+  it("allows a newly added model with no input metadata to use a native image transport", () => {
+    expect(resolveReadImagePolicy(primary(false, "native"), undefined, true)).toEqual({ mode: "native" });
+    expect(resolveReadImagePolicy(primary(false, "native"), undefined, false)).toEqual({ mode: "unavailable" });
+  });
+
+  it.each([[], ["text"]])("honors explicit input metadata %j", (...input) => {
+    const model = { entry: { modalities: { input } }, capabilities: { imageToolResult: "native" } } as never;
+    expect(resolveReadImagePolicy(model, undefined, true)).toEqual({ mode: "unavailable" });
+    expect(resolveReadImagePolicy(model, vision(), true)).toEqual({ mode: "unavailable" });
+  });
+
+  it.each(["unsupported", "unknown"] as const)("does not infer support for an undeclared model on a %s transport", (capability) => {
+    expect(resolveReadImagePolicy(primary(false, capability), undefined, true)).toEqual({ mode: "unavailable" });
+  });
+
+  it.each(["unsupported", "unknown"] as const)("does not substitute vision captions for %s transports", (capability) => {
+    expect(resolveReadImagePolicy(primary(true, capability), vision(), true)).toEqual({ mode: "unavailable" });
+  });
+
+  it("propagates a native route media allowlist", () => {
+    expect(resolveReadImagePolicy(primary(true, "native", ["image/png", "image/jpeg"]), vision(), true)).toEqual({
+      mode: "native",
+      nativeMediaTypes: ["image/png", "image/jpeg"],
+    });
+  });
+
+  it("does not substitute vision captions when direct image input is disabled", () => {
+    expect(resolveReadImagePolicy(primary(true, "native"), vision(), false)).toEqual({ mode: "unavailable" });
+  });
+
+  it("fails closed when neither native projection nor vision is available", () => {
+    expect(resolveReadImagePolicy(primary(true, "unknown"), undefined, true)).toEqual({ mode: "unavailable" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ChannelRuntime scheduling
+// ---------------------------------------------------------------------------
+
+async function runtime(
+  providerTools?: ToolSet,
+  configOverrides: Partial<Config> = {},
+  bot: { selfId: string; sendMessage: unknown } = { selfId: "bot", sendMessage: vi.fn() },
+  context: ChannelContext = { type: "guild", platform: "test", channelId: "room", guildId: "room" },
+  messageBatch?: MessageBatchPlugin,
+  will: Record<string, unknown> = { decide: state.decide, observe: state.observe },
+  historyProjection?: ChannelRuntimeOptions["historyProjection"],
+  channelOutputTools?: ChannelRuntimeOptions["channelOutputTools"],
+) {
+  const root = await mkdtemp(join(tmpdir(), "yesimbot-runtime-"));
+  const channel = new Channel(context, root);
+  await channel.conversation.init();
+  const value = new ChannelRuntime(new TestEvents(), {
+    channel,
+    bot: bot as never,
+    will: will as never,
+    model: {} as never,
+    readImagePolicy: { mode: "unavailable" },
+    config: { ...config, ...configOverrides },
+    plugins: [],
+    providerTools,
+    messageBatch,
+    historyProjection,
+    ...(channelOutputTools ? { channelOutputTools } : {}),
+  });
+  await value.init();
+  return { value, channel, root };
+}
+
+async function holdConversationTurn(value: ChannelRuntime, turnId: string): Promise<() => Promise<void>> {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  state.run.mockReturnValueOnce(
+    (async function* () {
+      yield { type: "turn.start", turnId };
+      await pending;
+      yield { type: "turn.done", turnId };
+    })(),
+  );
+  const result = await value.post(message("active-input", "user-1", 0), { onTurnStart: started });
+  await ready;
+  state.active = turnId;
+  state.run.mockClear();
+  state.append.mockClear();
+  return async () => {
+    release();
+    if (result.kind === "run") await result.done;
+    state.active = null;
+  };
+}
+
+describe("ChannelRuntime scheduling", () => {
+  beforeEach(() => {
+    state.active = null;
+    vi.mocked(createAgent).mockClear();
+    state.append.mockReset().mockResolvedValue(undefined);
+    state.observeInput.mockReset();
+    state.send.mockReset();
+    state.run.mockReset().mockReturnValue((async function* () {})());
+    state.decide.mockReset().mockResolvedValue("wait");
+    state.decideBatch.mockReset().mockResolvedValue({ decision: "wait" });
+    state.settleReservation.mockReset().mockResolvedValue(undefined);
+    state.observe.mockReset();
+  });
+  it("registers the working-set tools and the final guard", async () => {
+    const { value, root } = await runtime();
+    try {
+      const options = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      expect(options.tools?.map((tool) => tool.name)).toEqual(expect.arrayContaining(["ctx_search", "ctx_expand", "ctx_reduce"]));
+      expect(options.beforeModelRequest).toBeTypeOf("function");
+      expect(options.requestProjection).toBeDefined();
+      expect(options.maxOutputTokens).toBeTypeOf("function");
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes provider-executed tools and retry configuration only to the main Agent", async () => {
+    const providerTools = { web_search: { type: "provider", id: "test.web_search", inputSchema: {} as never } } as ToolSet;
+    const { value, root } = await runtime(providerTools, { modelRetries: 3 });
+    try {
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
+      expect(agentConfig?.providerTools).toMatchObject(providerTools);
+      expect(agentConfig?.providerTools?.web_search).toMatchObject({ capability: { sensitive: false, executionKind: "read" } });
+      expect(agentConfig?.maxRetries).toBe(3);
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("lets a turn that runs out of steps report through send_message and logs it", async () => {
+    const { value, root } = await runtime(undefined, { maxSteps: 40 });
+    try {
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      expect(agentConfig.maxSteps).toBe(40);
+      expect(agentConfig.stepLimitReportTools).toEqual(["send_message"]);
+      expect(agentConfig.tools?.map((tool) => tool.name)).toContain("send_message");
+      const warn = vi.spyOn((value as unknown as { logger: { warn: (...args: unknown[]) => void } }).logger, "warn");
+      agentConfig.onStepLimit!({ turnId: "turn-1", steps: 40 });
+      expect(warn).toHaveBeenCalledWith("runtime.step_limit", expect.objectContaining({ turnId: "turn-1", steps: 40 }));
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+    // Without a configured limit the runtime default applies.
+    const fallback = await runtime();
+    try {
+      expect(vi.mocked(createAgent).mock.calls.at(-1)![0].maxSteps).toBeUndefined();
+    } finally {
+      await fallback.value.stop();
+      await rm(fallback.root, { recursive: true, force: true });
+    }
+  });
+
+  it("marks only the current model input with a current-message boundary", async () => {
+    const { value, root } = await runtime();
+    try {
+      const plugin = vi
+        .mocked(createAgent)
+        .mock.calls.at(-1)?.[0]
+        .plugins?.find((item) => item.name === "core.model-input");
+      expect(plugin?.toModelMessages).toBeDefined();
+
+      const historical = createMessage(message("zeta-1", "zeta", 1));
+      const current = createMessage(message("jiang-1", "443306717", 2));
+      const context = { history: [historical], current: [current] } as never;
+      const historicalProjection = await plugin!.toModelMessages!(historical, context);
+      const currentProjection = await plugin!.toModelMessages!(current, context);
+      const historicalContent = String((Array.isArray(historicalProjection) ? historicalProjection[0] : historicalProjection)?.content);
+      const currentContent = String((Array.isArray(currentProjection) ? currentProjection[0] : currentProjection)?.content);
+
+      expect(historicalContent).not.toContain("[CURRENT_MESSAGE]");
+      expect(currentContent).toContain("[CURRENT_MESSAGE]");
+      expect(currentContent).toContain('sender="443306717 (443306717)"');
+      expect(currentContent).toContain('id="jiang-1"');
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("projects direct image bytes for the current input and later live-turn continuations", async () => {
+    const assetId = "33333333333333333333333333333333";
+    const current = createMessage({ ...message("image-1", "443306717", 2), parts: [{ type: "image", asset: assetId }] });
+    const resolveImage = vi.fn(async (id: string) => ({ bytes: new Uint8Array([1, 2, 3]), mediaType: id === assetId ? "image/png" : "image/jpeg" }));
+    const plugin = createModelInputPlugin("default", false, { resolveImage });
+
+    const first = await plugin.toModelMessages!(current, { history: [], current: [current], live: [current] } as never);
+    const continuation = await plugin.toModelMessages!(current, { history: [current], current: [], activeInputs: [current], live: [current] } as never);
+    const afterJoin = await plugin.toModelMessages!(current, { history: [current], current: [], activeInputs: [], live: [current] } as never);
+    const firstContent = (Array.isArray(first) ? first[0] : first)?.content;
+    const continuationContent = (Array.isArray(continuation) ? continuation[0] : continuation)?.content;
+
+    expect(firstContent).toEqual([
+      { type: "text", text: expect.stringContaining("[CURRENT_MESSAGE]") },
+      { type: "image", image: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
+      { type: "text", text: expect.stringContaining("[/CURRENT_MESSAGE]") },
+    ]);
+    expect(continuationContent).toEqual(firstContent);
+    expect((Array.isArray(afterJoin) ? afterJoin[0] : afterJoin)?.content).toEqual([
+      { type: "text", text: expect.stringContaining('id="image-1"') },
+      { type: "image", image: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
+    ]);
+    expect(resolveImage).toHaveBeenCalledTimes(3);
+  });
+
+  it("merges adjacent Gemini user turns", async () => {
+    const plugin = createModelInputPlugin("gemini-native");
+
+    const prepared = await plugin?.prepareStep?.(
+      [
+        { role: "user", content: "第一段" },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "第二段" },
+            { type: "file", data: new Uint8Array([1]), mediaType: "image/png" },
+          ],
+        },
+        { role: "assistant", content: "边界" },
+        { role: "user", content: "第三段" },
+      ],
+      { turnId: "turn-gemini" } as never,
+    );
+
+    expect(prepared).toHaveLength(3);
+    expect(prepared?.[0]).toMatchObject({
+      role: "user",
+      content: [
+        { type: "text", text: "第一段" },
+        { type: "text", text: "\n" },
+        { type: "text", text: "第二段" },
+        { type: "file", mediaType: "image/png" },
+      ],
+    });
+    expect(prepared?.[1]).toEqual({ role: "assistant", content: "边界" });
+    expect(prepared?.[2]).toEqual({ role: "user", content: "第三段" });
+  });
+
+  it("commits trigger false without Will or a turn", async () => {
+    const { value, root } = await runtime();
+    try {
+      await expect(value.post(event, { trigger: false, ifBusy: "join" })).resolves.toMatchObject({ kind: "wait" });
+      expect(state.append).toHaveBeenCalledTimes(1);
+      expect(state.decide).not.toHaveBeenCalled();
+      expect(state.send).not.toHaveBeenCalled();
+      expect(state.run).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("rejects before append when busy", async () => {
+    state.active = "active";
+    const { value, root } = await runtime();
+    try {
+      await expect(value.post(event, { ifBusy: "reject" })).rejects.toThrow();
+      expect(state.append).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("joins the active turn without a second run consumer", async () => {
+    state.active = "active";
+    const { value, root } = await runtime();
+    try {
+      await expect(value.post(event, { ifBusy: "join" })).resolves.toEqual({ kind: "join", eventId: expect.any(String), turnId: "active" });
+      expect(state.send).toHaveBeenCalledOnce();
+      expect(state.run).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("runs event posts with an isolated model-history mode", async () => {
+    const { value, root } = await runtime();
+    try {
+      const result = await value.post(event);
+      if (result.kind === "run") await result.done;
+      expect(state.run).toHaveBeenCalledWith(expect.objectContaining({ role: "custom", type: "yesimbot.event" }), { ifBusy: "defer", historyMode: "event" });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows an explicitly posted event to use conversation history", async () => {
+    const { value, root } = await runtime();
+    try {
+      const result = await value.post(event, { historyMode: "conversation" });
+      if (result.kind === "run") await result.done;
+      expect(state.run).toHaveBeenCalledWith(expect.objectContaining({ role: "custom", type: "yesimbot.event" }), {
+        ifBusy: "defer",
+        historyMode: "conversation",
+      });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports how a posted turn ended and whether it sent anything to its channel", async () => {
+    const sendMessage = vi.fn().mockResolvedValue(["sent-1"]);
+    state.run
+      .mockImplementationOnce(() =>
+        (async function* () {
+          yield { type: "turn.start", turnId: "turn-sent" };
+          state.active = "turn-sent";
+          const send = vi
+            .mocked(createAgent)
+            .mock.calls.at(-1)?.[0]
+            .tools?.find((tool) => tool.name === "send_message");
+          await send?.execute?.({ parts: [{ kind: "text", text: "签到好了" }] }, { toolCallId: "call", turnId: "turn-sent", abortSignal: undefined } as never);
+          state.active = null;
+          yield { type: "turn.done", turnId: "turn-sent" };
+        })(),
+      )
+      .mockImplementationOnce(() =>
+        (async function* () {
+          yield { type: "turn.start", turnId: "turn-quiet" };
+          yield { type: "turn.done", turnId: "turn-quiet" };
+        })(),
+      )
+      .mockImplementationOnce(() =>
+        (async function* () {
+          yield { type: "turn.start", turnId: "turn-failed" };
+          yield { type: "turn.failed", turnId: "turn-failed", error: { name: "Error", message: "failed" } };
+        })(),
+      );
+    const { value, root } = await runtime(undefined, {}, { selfId: "bot", sendMessage });
+    try {
+      for (const expected of [
+        { status: "done", delivered: true },
+        { status: "done", delivered: false },
+        { status: "failed", delivered: false },
+      ]) {
+        const result = await value.post(event);
+        expect(result.kind).toBe("run");
+        if (result.kind === "run") {
+          await result.done;
+          expect(await result.outcome).toEqual(expected);
+        }
+      }
+      expect(sendMessage).toHaveBeenCalledOnce();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("observes actual turn start after queueing and does not wait for the observer", async () => {
+    let release!: () => void;
+    const queued = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    state.run.mockReturnValue(
+      (async function* () {
+        yield { type: "turn.queued", turnId: "deferred" };
+        await queued;
+        yield { type: "turn.start", turnId: "deferred" };
+        yield { type: "turn.start", turnId: "deferred" };
+        yield { type: "turn.done", turnId: "deferred" };
+      })(),
+    );
+    const observer = vi.fn((_turn: { turnId: string; startedAt: string }) => new Promise<void>(() => {}));
+    const { value, root } = await runtime();
+    try {
+      const result = await value.post(event, { onTurnStart: observer });
+      expect(result.kind).toBe("run");
+      expect(observer).not.toHaveBeenCalled();
+      const before = Date.now();
+      release();
+      if (result.kind === "run") {
+        await result.done;
+        expect(await result.outcome).toEqual({ status: "done", delivered: false });
+      }
+      expect(observer).toHaveBeenCalledOnce();
+      const turn = observer.mock.calls[0][0];
+      expect(turn.turnId).toBe("deferred");
+      expect(Date.parse(turn.startedAt)).toBeGreaterThanOrEqual(before);
+      expect(Date.parse(turn.startedAt)).toBeLessThanOrEqual(Date.now());
+    } finally {
+      release();
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["sync", "async"])("keeps running when the start observer fails (%s)", async (mode) => {
+    state.run.mockReturnValue(
+      (async function* () {
+        yield { type: "turn.start", turnId: "observer-failure" };
+        yield { type: "turn.done", turnId: "observer-failure" };
+      })(),
+    );
+    const failure = new Error("history-write-failed");
+    const observer = vi.fn(() => {
+      if (mode === "sync") throw failure;
+      return Promise.reject(failure);
+    });
+    const { value, root } = await runtime();
+    const warn = vi.spyOn((value as unknown as { logger: { warn: (...args: unknown[]) => void } }).logger, "warn");
+    try {
+      const result = await value.post(event, { onTurnStart: observer });
+      if (result.kind === "run") {
+        await result.done;
+        expect(await result.outcome).toEqual({ status: "done", delivered: false });
+      }
+      expect(warn).toHaveBeenCalledWith("runtime.turn_start_observer_failed", { turnId: "observer-failure", cause: failure });
+    } finally {
+      warn.mockRestore();
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not announce a start for wait, join, busy rejection or abort before start", async () => {
+    const observer = vi.fn();
+    const { value, root } = await runtime();
+    try {
+      await value.post(event, { trigger: false, onTurnStart: observer });
+      state.active = "active";
+      await value.post(event, { ifBusy: "join", onTurnStart: observer });
+      await expect(value.post(event, { ifBusy: "reject", onTurnStart: observer })).rejects.toThrow();
+      state.active = null;
+      state.run.mockReturnValue(
+        (async function* () {
+          yield { type: "turn.queued", turnId: "never-started" };
+          yield { type: "turn.aborted", turnId: "never-started", reason: "stopped" };
+        })(),
+      );
+      const result = await value.post(event, { onTurnStart: observer });
+      if (result.kind === "run") {
+        await result.done;
+        expect(await result.outcome).toEqual({ status: "aborted", delivered: false });
+      }
+      expect(observer).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("runs an active post without delivering the model text output", async () => {
+    state.run.mockReturnValue(
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-1" };
+        yield { type: "message.appended", turnId: "turn-1", message: { role: "assistant", id: "message-1", content: "内部规划，不应发送" } };
+        yield { type: "turn.done", turnId: "turn-1" };
+      })(),
+    );
+    const bot = { selfId: "bot", sendMessage: vi.fn() };
+    const { value, root } = await runtime(undefined, {}, bot);
+    try {
+      const result = await value.post(event);
+      expect(result.kind).toBe("run");
+      if (result.kind === "run") await result.done;
+      expect(bot.sendMessage).not.toHaveBeenCalled();
+      expect(state.send).not.toHaveBeenCalled();
+      expect(state.decide).not.toHaveBeenCalled();
+      expect(state.run).toHaveBeenCalledOnce();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not expose describe_image when native read gives the primary model original pixels", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtime-native-image-"));
+    const channel = new Channel({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, root);
+    await channel.conversation.init();
+    const value = new ChannelRuntime(new TestEvents(), {
+      channel,
+      bot: { selfId: "bot", sendMessage: vi.fn() } as never,
+      will: { decide: state.decide, observe: state.observe } as never,
+      model: {} as never,
+      visionModel: {} as never,
+      readImagePolicy: { mode: "native" },
+      config,
+      plugins: [],
+    });
+    await value.init();
+    try {
+      const tools = vi.mocked(createAgent).mock.calls.at(-1)?.[0].tools ?? [];
+      expect(tools.map((tool) => tool.name)).toContain("read");
+      expect(tools.map((tool) => tool.name)).not.toContain("describe_image");
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("shares one image projection store and clears current-turn pixels on turn finish", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtime-image-projection-"));
+    const channel = new Channel({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, root, true);
+    await channel.conversation.init();
+    const imageProjection = new EphemeralImageProjectionStore();
+    const value = new ChannelRuntime(new TestEvents(), {
+      channel,
+      bot: { selfId: "bot", sendMessage: vi.fn() } as never,
+      will: { decide: state.decide, observe: state.observe } as never,
+      model: {} as never,
+      readImagePolicy: { mode: "native" },
+      imageProjection,
+      config,
+      plugins: [],
+    });
+    await value.init();
+    try {
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
+      const read = agentConfig?.tools?.find((tool) => tool.name === "read");
+      const lifecycle = agentConfig?.plugins?.find((plugin) => plugin.name === "core.image-projection");
+      const input = { uri: `asset://${await channel.resources.assets.put(PNG_BYTES)}` };
+      const output = await read!.execute(input, { toolCallId: "call", turnId: "turn-1", messages: [] } as never);
+      expect(imageProjection.has("call")).toBe(true);
+      expect((await read?.toModelOutput?.({ toolCallId: "call", input, output } as never))?.type).toBe("content");
+      await lifecycle?.onTurnFinish?.({ turnId: "turn-1", status: "done", messages: [] }, { turnId: "turn-1" } as never);
+      expect(await read?.toModelOutput?.({ toolCallId: "call", input, output } as never)).toMatchObject({
+        type: "json",
+        value: { imageMode: "unavailable", error: "image_projection_unavailable" },
+      });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("exposes send_message and finish with the expected turn-ending semantics", async () => {
+    const { value, root } = await runtime();
+    try {
+      const tools = vi.mocked(createAgent).mock.calls.at(-1)?.[0].tools ?? [];
+      const send = tools.find((tool) => tool.name === "send_message");
+      const finish = tools.find((tool) => tool.name === "finish");
+      expect(tools.map((tool) => tool.name)).toContain("ctx_expand");
+      expect(send?.terminal).toBe(false);
+      expect(finish?.terminal).toBe(true);
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks authored and registered channel output for a silent post and allows it otherwise", async () => {
+    let blockedDuringTurn: Record<string, unknown> = {};
+    let allowedAfterTurn: Record<string, unknown> = {};
+    const plugin = () =>
+      vi
+        .mocked(createAgent)
+        .mock.calls.at(-1)?.[0]
+        .plugins?.find((item) => item.name === "core.silent-turn");
+    const check = (toolName: string, toolCallId: string) =>
+      plugin()?.beforeToolCall?.(
+        { toolCallId, toolName, args: {} } as never,
+        {
+          turnId: "turn-1",
+        } as never,
+      );
+    state.run.mockImplementation(() =>
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-1" };
+        blockedDuringTurn = {
+          send: await check("send_message", "c1"),
+          forward: await check("onebot_send_forward_message", "c2"),
+          sticker: await check("sticker_send", "c3"),
+          unrelated: await check("onebot_get_forward_message", "c4"),
+        };
+        yield { type: "turn.done", turnId: "turn-1" };
+      })(),
+    );
+    const { value, root } = await runtime(
+      undefined,
+      {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      new Set(["onebot_send_forward_message", "sticker_send"]),
+    );
+    try {
+      const result = await value.post(event, { delivery: "silent" });
+      if (result.kind === "run") await result.done;
+      allowedAfterTurn = {
+        send: await check("send_message", "c5"),
+        forward: await check("onebot_send_forward_message", "c6"),
+        sticker: await check("sticker_send", "c7"),
+        unrelated: await check("onebot_get_forward_message", "c8"),
+      };
+
+      expect(blockedDuringTurn.send).toMatchObject({ type: "block" });
+      expect(blockedDuringTurn.forward).toMatchObject({ type: "block" });
+      expect(blockedDuringTurn.sticker).toMatchObject({ type: "block" });
+      expect(blockedDuringTurn.unrelated).toEqual({ type: "allow" });
+      expect(allowedAfterTurn).toEqual({
+        send: { type: "allow" },
+        forward: { type: "allow" },
+        sticker: { type: "allow" },
+        unrelated: { type: "allow" },
+      });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("defers a passive shared trigger instead of joining an active turn", async () => {
+    state.active = "active";
+    state.decide.mockResolvedValue("trigger");
+    const { value, root } = await runtime();
+    try {
+      await expect(value.handle(event)).resolves.toMatchObject({ kind: "run" });
+      expect(state.send).not.toHaveBeenCalled();
+      expect(state.run).toHaveBeenCalledWith(expect.anything(), { ifBusy: "defer", historyMode: "event" });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps joining passive direct messages into the active turn", async () => {
+    state.decide.mockResolvedValue("trigger");
+    const { value, root } = await runtime(
+      undefined,
+      {},
+      { selfId: "bot", sendMessage: vi.fn() },
+      { type: "direct", platform: "test", selfId: "bot", channelId: "private:user", userId: "user" },
+    );
+    const finish = await holdConversationTurn(value, "active");
+    try {
+      await expect(value.handle(message("followup", "user", 2))).resolves.toMatchObject({ kind: "join", turnId: "active" });
+      expect(state.send).toHaveBeenCalledWith(expect.anything(), { ifBusy: "join" });
+      expect(state.run).not.toHaveBeenCalled();
+    } finally {
+      await finish();
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("runs passive trigger and observes only after the turn ends", async () => {
+    state.decide.mockResolvedValue("trigger");
+    state.run.mockReturnValue(
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-1" };
+        yield { type: "message.appended", turnId: "turn-1", message: { role: "assistant", id: "message-1", content: "reply" } };
+        yield { type: "turn.done", turnId: "turn-1" };
+      })(),
+    );
+    const { value, root } = await runtime();
+    try {
+      const result = await value.handle(event);
+      expect(result.kind).toBe("run");
+      if (result.kind === "run") await result.done;
+      expect(state.decide).toHaveBeenCalledOnce();
+      expect(state.observe).toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn-1", status: "done" }));
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("observes a passive turn that ends without any tool call", async () => {
+    state.decide.mockResolvedValue("trigger");
+    state.run.mockReturnValue(
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-1" };
+        yield { type: "turn.done", turnId: "turn-1" };
+      })(),
+    );
+    const { value, root } = await runtime();
+    try {
+      const result = await value.handle(event);
+      expect(result.kind).toBe("run");
+      if (result.kind === "run") await result.done;
+      expect(state.observe).toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn-1", status: "done" }));
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("returns wait without running the Agent when passive Will waits", async () => {
+    const { value, root } = await runtime();
+    try {
+      await expect(value.handle(event)).resolves.toMatchObject({ kind: "wait" });
+      expect(state.run).not.toHaveBeenCalled();
+      expect(state.observe).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("continues FIFO work after a rejected busy operation", async () => {
+    state.active = "active";
+    const { value, root } = await runtime();
+    try {
+      await expect(value.post(event, { ifBusy: "reject" })).rejects.toThrow();
+      state.active = null;
+      state.run.mockReturnValue((async function* () {})());
+      await expect(value.post(event)).resolves.toMatchObject({ kind: "run" });
+      expect(state.append).toHaveBeenCalledOnce();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps one output consumer for a joined active turn", async () => {
+    state.active = "active";
+    const { value, root } = await runtime();
+    try {
+      await expect(value.post(event, { ifBusy: "join" })).resolves.toMatchObject({ kind: "join", turnId: "active" });
+      expect(state.run).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("persists and queues ordinary messages without evaluating Will immediately", async () => {
+    const batching = batchPlugin();
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, batching.plugin);
+    try {
+      await expect(value.handle(message("message-1", "user-1", 1))).resolves.toMatchObject({ kind: "wait" });
+
+      expect(state.append).toHaveBeenCalledOnce();
+      expect(batching.controller.enqueue).toHaveBeenCalledOnce();
+      expect(state.decide).not.toHaveBeenCalled();
+      expect(state.run).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("evaluates every batch message once in order and starts at most one deferred turn", async () => {
+    state.active = "active-turn";
+    state.decide.mockResolvedValueOnce("wait").mockResolvedValueOnce("trigger").mockResolvedValueOnce("wait");
+    const batching = batchPlugin();
+    const { value, channel, root } = await runtime(undefined, {}, undefined, undefined, batching.plugin);
+    try {
+      await value.handle(message("message-1", "user-1", 1));
+      await value.handle(message("message-2", "user-2", 2));
+      await value.handle(message("message-3", "user-1", 3));
+      const queued = batching.controller.enqueue.mock.calls.map(([input]) => input);
+
+      await batching.flush(queued);
+
+      expect(state.decide.mock.calls.map(([input]) => input.data.messageId)).toEqual(["message-1", "message-2", "message-3"]);
+      const decisions = (await channel.conversation.storage.read()).filter((entry) => entry.type === "event" && entry.data.type === "will.decision");
+      expect(decisions).toHaveLength(3);
+      expect(state.run).toHaveBeenCalledOnce();
+      expect(state.run).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ messageId: "message-3" }) }), {
+        ifBusy: "defer",
+        historyMode: "conversation",
+        contextMessages: [queued[0], queued[1]],
+      });
+      expect(state.send).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("joins a direct batch into its active turn (batch-aware Will: %s)", async (batchAware) => {
+    state.decide.mockResolvedValue("trigger");
+    state.decideBatch.mockResolvedValue({ decision: "trigger", reservationId: "joined-reservation" });
+    const batching = batchPlugin();
+    const will = {
+      decide: state.decide,
+      observe: state.observe,
+      ...(batchAware ? { decideBatch: state.decideBatch, settleReservation: state.settleReservation } : {}),
+    };
+    const { value, root } = await runtime(
+      undefined,
+      {},
+      undefined,
+      { type: "direct", platform: "test", channelId: "room", userId: "user-1", selfId: "bot" },
+      batching.plugin,
+      will,
+    );
+    const finish = await holdConversationTurn(value, "active-turn");
+    try {
+      await value.handle(message("first", "user-1", 1));
+      await value.handle(message("followup", "user-1", 2));
+      const queued = batching.controller.enqueue.mock.calls.map(([input]) => input);
+
+      await batching.flush(queued);
+      await batching.flush(queued);
+
+      expect(state.send).toHaveBeenCalledExactlyOnceWith(queued[1], { ifBusy: "join", contextMessages: [queued[0]] });
+      expect(state.run).not.toHaveBeenCalled();
+      expect(state.append).toHaveBeenCalledTimes(2);
+      if (batchAware)
+        expect(state.settleReservation).toHaveBeenCalledExactlyOnceWith("joined-reservation", {
+          kind: "release",
+          turnId: "active-turn",
+          reason: "joined-active-turn",
+        });
+    } finally {
+      await finish();
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("joins a direct batch-aware decision even without a batch plugin", async () => {
+    state.decideBatch.mockResolvedValue({ decision: "trigger" });
+    const { value, root } = await runtime(
+      undefined,
+      {},
+      undefined,
+      { type: "direct", platform: "test", channelId: "room", userId: "user-1", selfId: "bot" },
+      undefined,
+      {
+        decide: state.decide,
+        decideBatch: state.decideBatch,
+        observe: state.observe,
+      },
+    );
+    const finish = await holdConversationTurn(value, "active-turn");
+    try {
+      await expect(value.handle(message("followup", "user-1", 2))).resolves.toMatchObject({ kind: "join", turnId: "active-turn" });
+      expect(state.send).toHaveBeenCalledExactlyOnceWith(expect.anything(), { ifBusy: "join" });
+      expect(state.run).not.toHaveBeenCalled();
+    } finally {
+      await finish();
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reserves posted input before starting a deferred turn", async () => {
+    state.active = "active-turn";
+    const { value, root } = await runtime();
+    try {
+      await value.post(message("queued-whisper", "user-1", 2));
+      expect(state.append).toHaveBeenCalledWith(expect.anything(), { deferred: true });
+      expect(state.run).toHaveBeenCalledExactlyOnceWith(expect.anything(), { ifBusy: "defer", historyMode: "conversation" });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("continues evaluating the batch after one Will decision throws", async () => {
+    state.decide.mockRejectedValueOnce(new Error("broken Will plugin")).mockResolvedValueOnce("trigger");
+    const batching = batchPlugin();
+    const { value, channel, root } = await runtime(undefined, {}, undefined, undefined, batching.plugin);
+    try {
+      await value.handle(message("message-1", "user-1", 1));
+      await value.handle(message("message-2", "user-2", 2));
+      const queued = batching.controller.enqueue.mock.calls.map(([input]) => input);
+
+      await expect(batching.flush(queued)).resolves.toBeUndefined();
+
+      expect(state.decide.mock.calls.map(([input]) => input.data.messageId)).toEqual(["message-1", "message-2"]);
+      const decisions = (await channel.conversation.storage.read()).filter((entry) => entry.type === "event" && entry.data.type === "will.decision");
+      expect(decisions).toHaveLength(1);
+      expect(state.run).toHaveBeenCalledOnce();
+      expect(state.run).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ messageId: "message-2" }) }), {
+        ifBusy: "defer",
+        historyMode: "conversation",
+        contextMessages: [queued[0]],
+      });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores a duplicate flush snapshot after processing every batch item once", async () => {
+    state.decide.mockResolvedValue("trigger");
+    const batching = batchPlugin();
+    const { value, channel, root } = await runtime(undefined, {}, undefined, undefined, batching.plugin);
+    try {
+      await value.handle(message("message-1", "user-1", 1));
+      await value.handle(message("message-2", "user-2", 2));
+      const queued = batching.controller.enqueue.mock.calls.map(([input]) => input);
+
+      await batching.flush(queued);
+      await batching.flush(queued);
+
+      expect(state.decide.mock.calls.map(([input]) => input.data.messageId)).toEqual(["message-1", "message-2"]);
+      const decisions = (await channel.conversation.storage.read()).filter((entry) => entry.type === "event" && entry.data.type === "will.decision");
+      expect(decisions).toHaveLength(2);
+      expect(state.run).toHaveBeenCalledOnce();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an all-wait batch silent and leaves Event records immediate", async () => {
+    const batching = batchPlugin();
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, batching.plugin);
+    try {
+      await value.handle(message("message-1", "user-1", 1));
+      await value.handle(message("message-2", "user-2", 2));
+      const queued = batching.controller.enqueue.mock.calls.map(([input]) => input);
+      await batching.flush(queued);
+
+      expect(state.decide).toHaveBeenCalledTimes(2);
+      expect(state.run).not.toHaveBeenCalled();
+
+      state.decide.mockResolvedValueOnce("trigger");
+      await expect(value.handle(event)).resolves.toMatchObject({ kind: "run" });
+      expect(batching.controller.enqueue).toHaveBeenCalledTimes(2);
+      expect(state.decide).toHaveBeenCalledTimes(3);
+      expect(state.run).toHaveBeenCalledOnce();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses one batch-aware Will decision, one reservation, and the validated candidate as the deferred Agent marker", async () => {
+    state.active = "active-turn";
+    state.decideBatch.mockResolvedValue({
+      decision: "trigger",
+      candidate: { inputId: "placeholder", authorId: "user-1", score: 80, probability: 0.8 },
+      reservationId: "reservation-1",
+    });
+    state.run.mockReturnValue(
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-1" };
+        yield { type: "turn.done", turnId: "turn-1" };
+      })(),
+    );
+    const batching = batchPlugin();
+    const will = {
+      decide: state.decide,
+      decideBatch: state.decideBatch,
+      settleReservation: state.settleReservation,
+      observe: state.observe,
+    };
+    const { value, channel, root } = await runtime(undefined, {}, undefined, undefined, batching.plugin, will);
+    try {
+      await value.handle(message("candidate", "user-1", 1));
+      await value.handle(message("latest", "user-2", 2));
+      const queued = batching.controller.enqueue.mock.calls.map(([input]) => input);
+      state.decideBatch.mockResolvedValue({
+        decision: "trigger",
+        candidate: { inputId: queued[0]!.id, authorId: "user-1", score: 80, probability: 0.8 },
+        reservationId: "reservation-1",
+      });
+
+      await batching.flush(queued);
+      await vi.waitFor(() => expect(state.settleReservation).toHaveBeenCalledOnce());
+
+      expect(state.decideBatch).toHaveBeenCalledOnce();
+      expect(state.decideBatch.mock.calls[0]?.[0].map((input: MessageBatchInput) => input.data.user.id)).toEqual(["user-1", "user-2"]);
+      expect(state.decide).not.toHaveBeenCalled();
+      expect(state.run).toHaveBeenCalledOnce();
+      expect(state.run).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ messageId: "candidate" }) }), {
+        ifBusy: "defer",
+        historyMode: "conversation",
+        contextMessages: [queued[1]],
+      });
+      expect(state.settleReservation).toHaveBeenCalledWith("reservation-1", {
+        kind: "release",
+        turnId: "turn-1",
+        reason: "done-without-delivery",
+      });
+      const decisions = (await channel.conversation.storage.read()).filter((entry) => entry.type === "event" && entry.data.type === "will.decision");
+      expect(decisions).toHaveLength(1);
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("admits a typed poke into the same ordered batch only through the optional Event controller", async () => {
+    const batching = batchPlugin({ acceptEvents: true });
+    const will = {
+      decide: state.decide,
+      decideBatch: state.decideBatch,
+      settleReservation: state.settleReservation,
+      observe: state.observe,
+    };
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, batching.plugin, will);
+    try {
+      await value.handle(message("before", "user-1", 1));
+      await value.handle(pokeEvent);
+      await value.handle(message("after", "user-3", 3));
+      const inputs = [batching.controller.enqueue.mock.calls[0]![0], batching.queuedEvents[0]!, batching.controller.enqueue.mock.calls[1]![0]];
+
+      await batching.flushInputs(inputs);
+
+      expect(batching.controller.enqueueEvent).toHaveBeenCalledOnce();
+      expect(state.decideBatch).toHaveBeenCalledOnce();
+      expect(state.decideBatch.mock.calls[0]?.[0].map((input: MessageBatchInput) => input.id)).toEqual(inputs.map((input) => input.id));
+      expect(state.decide).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("commits a reservation on the first real current-channel delivery even when a later segment fails", async () => {
+    state.decideBatch.mockResolvedValue({ decision: "trigger", reservationId: "reservation-delivered" });
+    const sendMessage = vi.fn().mockResolvedValueOnce(["sent-1"]).mockRejectedValueOnce(new Error("second failed"));
+    state.run.mockImplementation(() =>
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-delivered" };
+        state.active = "turn-delivered";
+        const send = vi
+          .mocked(createAgent)
+          .mock.calls.at(-1)?.[0]
+          .tools?.find((tool) => tool.name === "send_message");
+        await send?.execute?.(
+          {
+            parts: [
+              { kind: "text", text: "first" },
+              { kind: "text", text: "second" },
+            ],
+          },
+          { toolCallId: "call", turnId: "turn-delivered", abortSignal: undefined } as never,
+        );
+        state.active = null;
+        yield { type: "turn.done", turnId: "turn-delivered" };
+      })(),
+    );
+    const will = { decide: state.decide, decideBatch: state.decideBatch, settleReservation: state.settleReservation, observe: state.observe };
+    const { value, root } = await runtime(undefined, {}, { selfId: "bot", sendMessage }, undefined, undefined, will);
+    try {
+      const result = await value.handle(message("message", "user", 1));
+      if (result.kind === "run") await result.done;
+
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+      expect(state.settleReservation).toHaveBeenCalledOnce();
+      expect(state.settleReservation).toHaveBeenCalledWith("reservation-delivered", {
+        kind: "commit",
+        turnId: "turn-delivered",
+        messageId: "sent-1",
+      });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retries a transient delivery settlement failure again at terminal cleanup", async () => {
+    state.decideBatch.mockResolvedValue({ decision: "trigger", reservationId: "reservation-transient" });
+    const settleReservation = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("transient-1"))
+      .mockRejectedValueOnce(new Error("transient-2"))
+      .mockRejectedValueOnce(new Error("transient-3"))
+      .mockResolvedValue(undefined);
+    const sendMessage = vi.fn(async () => ["sent-transient"]);
+    state.run.mockImplementation(() =>
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-transient" };
+        state.active = "turn-transient";
+        const send = vi
+          .mocked(createAgent)
+          .mock.calls.at(-1)?.[0]
+          .tools?.find((tool) => tool.name === "send_message");
+        await send?.execute?.({ parts: [{ kind: "text", text: "hello" }] }, { toolCallId: "call", turnId: "turn-transient", abortSignal: undefined });
+        state.active = null;
+        yield { type: "turn.done", turnId: "turn-transient" };
+      })(),
+    );
+    const will = { decide: state.decide, decideBatch: state.decideBatch, settleReservation, observe: state.observe };
+    const { value, root } = await runtime(undefined, {}, { selfId: "bot", sendMessage }, undefined, undefined, will);
+    try {
+      const result = await value.handle(message("message", "user", 1));
+      if (result.kind === "run") await result.done;
+
+      expect(settleReservation).toHaveBeenCalledTimes(4);
+      expect(settleReservation).toHaveBeenLastCalledWith("reservation-transient", {
+        kind: "commit",
+        turnId: "turn-transient",
+        messageId: "sent-transient",
+      });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [
+      "silent",
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-release" };
+        yield { type: "turn.done", turnId: "turn-release" };
+      })(),
+      "done-without-delivery",
+    ],
+    [
+      "failed",
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-release" };
+        yield { type: "turn.failed", turnId: "turn-release", error: { name: "Error", message: "failed" } };
+      })(),
+      "failed",
+    ],
+    [
+      "aborted",
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-release" };
+        yield { type: "turn.aborted", turnId: "turn-release", reason: "stop" };
+      })(),
+      "aborted",
+    ],
+    [
+      "consume-failed",
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-release" };
+        throw new Error("stream failed");
+      })(),
+      "consume-failed",
+    ],
+  ] as const)("releases a %s reservation exactly once", async (_label, stream, reason) => {
+    state.decideBatch.mockResolvedValue({ decision: "trigger", reservationId: "reservation-release" });
+    state.run.mockReturnValue(stream);
+    const will = { decide: state.decide, decideBatch: state.decideBatch, settleReservation: state.settleReservation, observe: state.observe };
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, undefined, will);
+    try {
+      const result = await value.handle(message("message", "user", 1));
+      if (result.kind === "run") await result.done;
+
+      expect(state.settleReservation).toHaveBeenCalledOnce();
+      expect(state.settleReservation).toHaveBeenCalledWith("reservation-release", { kind: "release", turnId: "turn-release", reason });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [
+      "all-failed",
+      vi.fn(async () => {
+        throw new Error("offline");
+      }),
+      {},
+    ],
+    ["zero-message-id", vi.fn(async () => []), {}],
+    ["cross-channel", vi.fn(async () => ["other-1"]), { channel: "other-room" }],
+  ])("does not confirm %s send_message completion", async (_label, sendMessage, input) => {
+    state.decideBatch.mockResolvedValue({ decision: "trigger", reservationId: "reservation-send" });
+    state.run.mockImplementation(() =>
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-send" };
+        const send = vi
+          .mocked(createAgent)
+          .mock.calls.at(-1)?.[0]
+          .tools?.find((tool) => tool.name === "send_message");
+        state.active = "turn-send";
+        await send?.execute?.({ parts: [{ kind: "text", text: "hello" }], ...input }, {
+          toolCallId: "call",
+          turnId: "turn-send",
+          abortSignal: undefined,
+        } as never);
+        state.active = null;
+        yield { type: "turn.done", turnId: "turn-send" };
+      })(),
+    );
+    const will = { decide: state.decide, decideBatch: state.decideBatch, settleReservation: state.settleReservation, observe: state.observe };
+    const { value, root } = await runtime(undefined, {}, { selfId: "bot", sendMessage }, undefined, undefined, will);
+    try {
+      const result = await value.handle(message("message", "user", 1));
+      if (result.kind === "run") await result.done;
+      expect(state.settleReservation).toHaveBeenCalledWith("reservation-send", {
+        kind: "release",
+        turnId: "turn-send",
+        reason: "done-without-delivery",
+      });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("releases before surfacing a synchronous Agent start failure", async () => {
+    state.decideBatch.mockResolvedValue({ decision: "trigger", reservationId: "reservation-start" });
+    state.run.mockImplementation(() => {
+      throw new Error("start failed");
+    });
+    const will = { decide: state.decide, decideBatch: state.decideBatch, settleReservation: state.settleReservation, observe: state.observe };
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, undefined, will);
+    try {
+      await expect(value.handle(message("message", "user", 1))).rejects.toThrow("start failed");
+      expect(state.settleReservation).toHaveBeenCalledWith("reservation-start", { kind: "release", reason: "start-failed" });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("releases a reservation if runtime stop wins the race after batch evaluation", async () => {
+    let resolveDecision!: (decision: { decision: "trigger"; reservationId: string }) => void;
+    state.decideBatch.mockReturnValue(
+      new Promise((resolve) => {
+        resolveDecision = resolve;
+      }),
+    );
+    const batching = batchPlugin();
+    const will = { decide: state.decide, decideBatch: state.decideBatch, settleReservation: state.settleReservation, observe: state.observe };
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, batching.plugin, will);
+    await value.handle(message("message-1", "user-1", 1));
+    const queued = batching.controller.enqueue.mock.calls.map(([input]) => input);
+
+    const flush = batching.flush(queued);
+    await vi.waitFor(() => expect(state.decideBatch).toHaveBeenCalledOnce());
+    const stop = value.stop();
+    resolveDecision({ decision: "trigger", reservationId: "reservation-stopped" });
+    await Promise.all([flush, stop]);
+
+    expect(state.run).not.toHaveBeenCalled();
+    expect(state.settleReservation).toHaveBeenCalledWith("reservation-stopped", { kind: "release", reason: "start-failed" });
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("stops the batch controller and ignores a stale flush after runtime stop", async () => {
+    const batching = batchPlugin();
+    const { value, root } = await runtime(undefined, {}, undefined, undefined, batching.plugin);
+    await value.handle(message("message-1", "user-1", 1));
+    const queued = batching.controller.enqueue.mock.calls.map(([input]) => input);
+
+    await value.stop();
+    await batching.flush(queued);
+
+    expect(batching.controller.stop).toHaveBeenCalledOnce();
+    expect(state.decide).not.toHaveBeenCalled();
+    expect(state.run).not.toHaveBeenCalled();
+    await rm(root, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ChannelRuntime archive rotation
+// ---------------------------------------------------------------------------
+
+const archiveConfig: Config = {
+  ...config,
+  session: {
+    magicContext: {},
+    archive: { maxKB: 0 },
+  },
+};
+
+async function createArchiveRuntime(archiveMaxBytes = 0) {
+  const root = await mkdtemp(join(tmpdir(), "yesimbot-periodic-"));
+  const channel = new Channel({ type: "guild", platform: "test", channelId: "room", guildId: "room" }, root);
+  await channel.conversation.init();
+  const value = new ChannelRuntime(new TestEvents(), {
+    channel,
+    bot: { selfId: "bot", sendMessage: vi.fn(async () => ["m1"]) } as never,
+    will: { decide: vi.fn().mockResolvedValue("wait"), observe: vi.fn() } as never,
+    model: {} as never,
+    readImagePolicy: { mode: "unavailable" },
+    archiveMaxBytes,
+    config: archiveConfig,
+    plugins: [],
+  });
+  await value.init();
+  return { value, channel, root };
+}
+
+describe("ChannelRuntime archive rotation", () => {
+  beforeEach(() => {
+    state.active = null;
+    state.append.mockReset().mockResolvedValue(undefined);
+    state.send.mockReset();
+    state.run.mockReset().mockReturnValue((async function* () {})());
+    state.wait.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("checks file size after a record even when it produced no response", async () => {
+    const { value, channel, root } = await createArchiveRuntime(1);
+    const archive = vi.spyOn(channel.conversation, "archiveIfOversize").mockResolvedValue(false);
+    try {
+      await value.post(event, { trigger: false });
+      expect(archive).toHaveBeenCalledWith(1);
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runtimes identity
+// ---------------------------------------------------------------------------
+
+describe("Runtimes identity", () => {
+  it.each([
+    { level: "high", auxiliary: true, expected: "low" },
+    { level: "high", auxiliary: false, expected: "low" },
+    { level: "off", auxiliary: false, expected: "off" },
+    { level: "minimal", auxiliary: true, expected: "minimal" },
+    { level: "low", auxiliary: true, expected: "low" },
+    { level: undefined, auxiliary: true, expected: "low" },
+  ] as const)("summarizes history with the auxiliary model at a scoped thinking level: %j", async ({ level, auxiliary, expected }) => {
+    const selectedId = auxiliary ? "test:aux" : "test:main";
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-scoped-historian-"));
+    const ctx = new TestEvents();
+    const channels = new Channels({ basePath: root });
+    const main = { provider: "test", modelId: "main" };
+    const aux = { provider: "test", modelId: "aux" };
+    const scoped = { provider: "test", modelId: selectedId.split(":")[1] };
+    const resolveChatModel = vi.fn((id: string, _context?: ChannelContext, options?: { thinkingLevel?: string }) => ({
+      fullId: id,
+      providerId: "test",
+      modelId: id.split(":")[1],
+      model: options ? scoped : id === "test:main" ? main : aux,
+      entry: { id: id.split(":")[1], reasoning: true, thinkingLevel: options?.thinkingLevel ?? level },
+    }));
+    const model = {
+      revision: 1,
+      contextLimit: () => undefined,
+      resolveChatModel,
+      resolveAuxiliaryModel: vi.fn((purpose: string, context?: ChannelContext) => ({ ...resolveChatModel("test:aux", context), route: "auxiliary", purpose })),
+    };
+    const runtimes = new Runtimes(
+      ctx,
+      channels,
+      model as never,
+      {
+        ...config,
+        basePath: root,
+        chatModel: "test:main",
+        auxiliaryModel: auxiliary ? "test:aux" : undefined,
+        logLevel: 0,
+      },
+      new Agents(),
+    );
+    try {
+      const channel = await channels.resolve({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+      await runtimes.get(channel, { selfId: "bot", sendMessage: vi.fn() } as never);
+      expect(model.resolveAuxiliaryModel.mock.calls.map((call) => call[0])).toEqual(auxiliary ? ["history-summary"] : []);
+      const overrideCalls = resolveChatModel.mock.calls.filter((call) => call[2] !== undefined);
+      expect(overrideCalls).toHaveLength(1);
+      expect(overrideCalls[0]).toEqual([selectedId, channel.context, { thinkingLevel: expected }]);
+      const ordinaryIds = resolveChatModel.mock.calls.filter((call) => call[2] === undefined).map((call) => call[0]);
+      expect(ordinaryIds).toEqual(auxiliary ? ["test:main", "test:aux"] : ["test:main"]);
+      expect(vi.mocked(createAgent).mock.calls.at(-1)![0].model).toBe(main);
+    } finally {
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps summarizing on the chat model when the auxiliary model is unusable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-history-selection-"));
+    const ctx = new TestEvents();
+    const channels = new Channels({ basePath: root });
+    const model = {
+      revision: 1,
+      contextLimit: () => undefined,
+      resolveChatModel: vi.fn((id: string) => ({ fullId: id, providerId: "test", modelId: "main", model: {}, entry: { id: "main" } })),
+      resolveAuxiliaryModel: vi.fn(() => {
+        throw new Error("auxiliary model unavailable");
+      }),
+    };
+    const runtimes = new Runtimes(
+      ctx,
+      channels,
+      model as never,
+      {
+        ...config,
+        basePath: root,
+        chatModel: "test:main",
+        auxiliaryModel: "test:missing",
+        logLevel: 0,
+      },
+      new Agents(),
+    );
+    try {
+      const channel = await channels.resolve({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+      await runtimes.get(channel, { selfId: "bot", sendMessage: vi.fn() } as never);
+      expect(model.resolveAuxiliaryModel).toHaveBeenCalledWith("history-summary", channel.context);
+      expect(model.resolveChatModel.mock.calls.map((call) => call[0])).toEqual(["test:main", "test:main"]);
+    } finally {
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses a runtime when the host hands out different wrappers for the same account", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-proxy-bot-"));
+    const ctx = new TestEvents();
+    const rawBot = testAccount("test", "bot");
+    const firstBot = { platform: "test", selfId: "bot", raw: rawBot, sendMessage: rawBot.sendMessage };
+    const secondBot = { platform: "test", selfId: "bot", raw: rawBot, sendMessage: rawBot.sendMessage };
+    expect(firstBot).toBeDefined();
+    expect(secondBot).toBeDefined();
+    expect(firstBot).not.toBe(secondBot);
+    expect(firstBot?.selfId).toBe(secondBot?.selfId);
+
+    const channels = new Channels({ basePath: root });
+    const model = {
+      contextLimit: () => undefined,
+      resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+      resolveAuxiliaryModel: vi.fn(() => {
+        throw new Error("auxiliary unavailable");
+      }),
+    };
+    const runtimes = new Runtimes(
+      ctx,
+      channels,
+      model as never,
+      { ...config, basePath: root },
+      new Agents(),
+      undefined,
+      undefined,
+      undefined,
+      (left, right) => (left as typeof firstBot).raw === (right as typeof firstBot).raw,
+    );
+    try {
+      const channel = await channels.resolve({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+      const first = await runtimes.get(channel, firstBot as never);
+      const stopped = vi.spyOn(first, "stop");
+      const second = await runtimes.get(channel, secondBot as never);
+
+      expect(second).toBe(first);
+      expect(stopped).not.toHaveBeenCalled();
+    } finally {
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["direct", "guild", "channel"] as const)("rebinds a %s runtime after reconnect without losing history", async (type) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-reconnect-"));
+    const ctx = new TestEvents();
+    const channels = new Channels({ basePath: root });
+    const model = {
+      contextLimit: () => undefined,
+      resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+      resolveAuxiliaryModel: vi.fn(() => {
+        throw new Error("auxiliary unavailable");
+      }),
+    };
+    const agents = new Agents();
+    const setup = vi.fn(async (_context: ChannelContext, _bot: unknown) => ({ name: "connection-plugin" }));
+    agents.use({ setup });
+    const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, agents);
+    try {
+      const scope: ChannelContext =
+        type === "direct"
+          ? { type, platform: "test", channelId: "@user", userId: "user", selfId: "bot" }
+          : { type, platform: "test", channelId: "room", guildId: type === "guild" ? "room" : "group" };
+      const channel = await channels.resolve(scope);
+      const oldBot = { platform: "test", selfId: "bot", sendMessage: vi.fn(async () => ["old-receipt"]) };
+      const newBot = { platform: "test", selfId: "bot", sendMessage: vi.fn(async () => ["new-receipt"]) };
+      const first = await runtimes.get(channel, oldBot as never);
+      const oldAgent = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      expect(await runtimes.get(channel, oldBot as never)).toBe(first);
+      expect(setup.mock.calls.at(-1)?.[1]).toBe(oldBot);
+      const oldSend = oldAgent.tools?.find((tool) => tool.name === "send_message");
+      state.active = "before";
+      await oldSend?.execute?.({ parts: [{ kind: "text", text: "before reconnect" }], mode: "raw" }, { toolCallId: "before", turnId: "before", messages: [] });
+      expect(oldBot.sendMessage).toHaveBeenCalledOnce();
+      oldBot.sendMessage.mockRejectedValue(new Error("old transport closed"));
+
+      const entry = createEntry("message", { id: "kept", timestamp: 1, role: "user", content: "keep this history" });
+      await channel.conversation.storage.append(entry);
+      const before = await channel.conversation.storage.read();
+      const sessionId = channel.conversation.currentSessionId();
+      const stopped = vi.spyOn(first, "stop");
+      const [replacement, same] = await Promise.all([runtimes.get(channel, newBot as never), runtimes.get(channel, newBot as never)]);
+      expect(replacement === first, "reconnect must replace the runtime bound to the old Bot").toBe(false);
+      expect(same).toBe(replacement);
+      expect(stopped).toHaveBeenCalledOnce();
+      expect(setup).toHaveBeenCalledTimes(2);
+      expect(setup.mock.calls.at(-1)?.[1]).toBe(newBot);
+      expect(model.resolveChatModel).toHaveBeenCalledTimes(4);
+      const newAgent = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      expect(channel.conversation.currentSessionId()).toBe(sessionId);
+      expect(await newAgent.storage?.read()).toEqual(before);
+      expect(await oldAgent.storage?.read()).toEqual(before);
+      expect(await channel.conversation.storage.read()).toEqual(before);
+      expect(before).toContainEqual(entry);
+      const newSend = newAgent.tools?.find((tool) => tool.name === "send_message");
+      state.active = "after";
+      await expect(
+        newSend?.execute?.({ parts: [{ kind: "text", text: "after reconnect" }], mode: "raw" }, { toolCallId: "after", turnId: "after", messages: [] }),
+      ).resolves.toMatchObject({ ok: true });
+      expect(newBot.sendMessage).toHaveBeenCalledOnce();
+      expect(oldBot.sendMessage).toHaveBeenCalledOnce();
+    } finally {
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes creation and replaces a shared runtime when Bot changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents());
+      const channel = await channels.resolve({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+      const botOne = { selfId: "one", platform: "test", sendMessage: vi.fn() };
+      const botTwo = { selfId: "two", platform: "test", sendMessage: vi.fn() };
+      const [first, same] = await Promise.all([runtimes.get(channel, botOne as never), runtimes.get(channel, botOne as never)]);
+      expect(first).toBe(same);
+      const replacement = await runtimes.get(channel, botTwo as never);
+      expect(replacement).not.toBe(first);
+      expect(replacement.context).toEqual({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("recreates a cached runtime after channel plugin registrations change", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const agents = new Agents();
+      const oldSetup = vi.fn(async () => ({ name: "old-image-tools" }));
+      const resolveOld = vi.fn(() => ({ characterDefinition: "OLD_ROLE" }));
+      const disposeOld = agents.use({ setup: oldSetup, roleProfile: { resolve: resolveOld } });
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, agents);
+      const scope = { type: "direct", platform: "test", selfId: "bot", userId: "user", channelId: "room" } as const;
+      const channel = await channels.resolve(scope);
+      const bot = { platform: "test", selfId: "bot" };
+
+      const first = await runtimes.get(channel, bot as never);
+      expect(oldSetup).toHaveBeenCalledOnce();
+      expect(resolveOld).toHaveBeenCalledBefore(oldSetup);
+      expect(oldSetup.mock.calls[0]?.[2]).toMatchObject({ rolePromptsManaged: true });
+      const firstConfig = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      const firstPrompt = (await (firstConfig.systemPrompt as () => Promise<Array<{ content: unknown }>>)()).map((block) => String(block.content)).join("\n");
+      expect(firstPrompt).toContain("OLD_ROLE");
+      expect(firstPrompt).not.toContain("Athena");
+      expect(firstPrompt.indexOf("OLD_ROLE")).toBeLessThan(firstPrompt.indexOf("# 互动策略"));
+
+      disposeOld();
+      const newSetup = vi.fn(async () => ({ name: "new-image-tools" }));
+      agents.use({ setup: newSetup, roleProfile: { resolve: () => ({ characterDefinition: "NEW_ROLE" }) } });
+      const replacement = await runtimes.get(channel, bot as never);
+
+      expect(replacement).not.toBe(first);
+      expect(newSetup).toHaveBeenCalledOnce();
+      const nextConfig = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      const nextPrompt = (await (nextConfig.systemPrompt as () => Promise<Array<{ content: unknown }>>)()).map((block) => String(block.content)).join("\n");
+      expect(nextPrompt).toContain("NEW_ROLE");
+      expect(nextPrompt).not.toContain("OLD_ROLE");
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["resolve", "setup"] as const)("retries a role replaced during %s before initializing stale plugins", async (phase) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-role-replacement-"));
+    const ctx = new TestEvents();
+    const channels = new Channels({ basePath: root });
+    const model = {
+      contextLimit: () => undefined,
+      resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+      resolveAuxiliaryModel: vi.fn(() => {
+        throw new Error("auxiliary unavailable");
+      }),
+    };
+    const agents = new Agents();
+    const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, agents);
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const pause = async () => {
+      entered();
+      await pending;
+    };
+    const stop = vi.fn();
+    const oldSetup = vi.fn(async () => {
+      if (phase === "setup") await pause();
+      return { name: "old-role", stop };
+    });
+    const dispose = agents.use({
+      roleProfile: {
+        resolve: async () => {
+          if (phase === "resolve") await pause();
+          return { characterDefinition: "STALE_ROLE" };
+        },
+      },
+      setup: oldSetup,
+    });
+    try {
+      const channel = await channels.resolve({ type: "direct", platform: "test", selfId: "bot", channelId: "user", userId: "user" });
+      const request = runtimes.get(channel, { platform: "test", selfId: "bot" } as never);
+      await started;
+      dispose();
+      const setup = vi.fn(() => ({ name: "replacement-role" }));
+      agents.use({ roleProfile: { resolve: () => ({ characterDefinition: "REPLACEMENT_ROLE" }) }, setup });
+      release();
+      await request;
+      expect(setup).toHaveBeenCalledOnce();
+      if (phase === "resolve") expect(oldSetup).not.toHaveBeenCalled();
+      else expect(stop).toHaveBeenCalledOnce();
+      const options = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      const prompt = await (options.systemPrompt as () => Promise<unknown>)();
+      expect(JSON.stringify(prompt)).toContain("REPLACEMENT_ROLE");
+      expect(JSON.stringify(prompt)).not.toContain("STALE_ROLE");
+    } finally {
+      release();
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recreates and stops a cached runtime after message-batch registrations change", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const batches = new MessageBatchRegistry();
+      const controller = { enqueue: vi.fn(), stop: vi.fn() };
+      const dispose = batches.use({ priority: 0, match: () => true, setup: vi.fn(async () => controller) });
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents(), batches);
+      const scope = { type: "direct", platform: "test", selfId: "bot", userId: "user", channelId: "room" } as const;
+      const channel = await channels.resolve(scope);
+      const bot = { platform: "test", selfId: "bot" };
+      const first = await runtimes.get(channel, bot as never);
+
+      dispose();
+      await vi.waitFor(() => expect(controller.stop).toHaveBeenCalledOnce());
+      const replacement = await runtimes.get(channel, bot as never);
+
+      expect(replacement).not.toBe(first);
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not publish a runtime whose message-batch plugin was removed during setup", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        revision: 0,
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const batches = new MessageBatchRegistry();
+      const controller = { enqueue: vi.fn(), stop: vi.fn() };
+      let markSetupStarted!: () => void;
+      let releaseSetup!: () => void;
+      const setupStarted = new Promise<void>((resolve) => {
+        markSetupStarted = resolve;
+      });
+      const setupRelease = new Promise<void>((resolve) => {
+        releaseSetup = resolve;
+      });
+      const dispose = batches.use({
+        priority: 0,
+        match: () => true,
+        setup: vi.fn(async () => {
+          markSetupStarted();
+          await setupRelease;
+          return controller;
+        }),
+      });
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents(), batches);
+      const scope = { type: "direct", platform: "test", selfId: "bot", userId: "user", channelId: "room" } as const;
+      const channel = await channels.resolve(scope);
+      const bot = { platform: "test", selfId: "bot" };
+      const pending = runtimes.get(channel, bot as never);
+
+      await setupStarted;
+      dispose();
+      releaseSetup();
+      const current = await pending;
+      await current.handle(message("message-1", "user", 1));
+
+      expect(controller.stop).toHaveBeenCalledOnce();
+      expect(controller.enqueue).not.toHaveBeenCalled();
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recreates a cached runtime after the model registry revision changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        revision: 1,
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents());
+      const scope = { type: "direct", platform: "test", selfId: "bot", userId: "user", channelId: "room" } as const;
+      const channel = await channels.resolve(scope);
+      const bot = { platform: "test", selfId: "bot" };
+      const first = await runtimes.get(channel, bot as never);
+
+      model.revision += 1;
+      const replacement = await runtimes.get(channel, bot as never);
+
+      expect(replacement).not.toBe(first);
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("proactively retires a cached runtime when the model registry changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      vi.mocked(createAgent).mockClear();
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        revision: 1,
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents());
+      const scope = { type: "direct", platform: "test", selfId: "bot", userId: "user", channelId: "room" } as const;
+      const channel = await channels.resolve(scope);
+      const bot = { platform: "test", selfId: "bot" };
+      const first = await runtimes.get(channel, bot as never);
+      const firstAgent = vi.mocked(createAgent).mock.results.at(-1)?.value;
+
+      model.revision = 2;
+      ctx.emit("yesimbot/model-registry-changed", 2);
+      await vi.waitFor(() => expect(firstAgent?.stop).toHaveBeenCalledOnce());
+      const replacement = await runtimes.get(channel, bot as never);
+
+      expect(replacement).not.toBe(first);
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { enabled: true, video: true, transport: "native" as const, admitted: true },
+    { enabled: false, video: true, transport: "native" as const, admitted: false },
+    { enabled: true, video: false, transport: "native" as const, admitted: false },
+    { enabled: true, video: true, transport: "unknown" as const, admitted: false },
+  ])("wires built-in video read from the actual primary gate: $enabled/$video/$transport", async ({ enabled, video, transport, admitted }) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-video-policy-"));
+    const ctx = new TestEvents();
+    const channels = new Channels({ basePath: root, videoInput: enabled });
+    const model = {
+      contextLimit: () => undefined,
+      resolveChatModel: vi.fn((id: string) => ({
+        fullId: id,
+        model: {} as never,
+        entry: { modalities: { input: video ? ["text", "video"] : ["text"] } },
+        capabilities: { imageToolResult: "unsupported", videoInput: transport },
+      })),
+    };
+    const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root, videoInput: enabled }, new Agents());
+    try {
+      const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+      const channel = await channels.resolve(scope);
+      await runtimes.get(channel, { platform: "test", selfId: "bot" } as never);
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      const read = agentConfig.tools!.find((tool) => tool.name === "read")!;
+      const uri = "asset://" + (await channel.resources.assets.put(VIDEO_BYTES));
+      state.active = "video-turn";
+      const result = await read.execute({ uri }, { toolCallId: "video-read", turnId: state.active, messages: [] } as never);
+      expect(result).toMatchObject({ videoMode: admitted ? "native" : "unavailable" });
+      const output = await read.toModelOutput!({ toolCallId: "video-read", input: { uri }, output: result });
+      expect(output.type).toBe(admitted ? "content" : "json");
+      if (admitted) {
+        const lifecycle = agentConfig.plugins!.find((plugin) => plugin.name === "core.image-projection")!;
+        await lifecycle.onTurnFinish!({ turnId: state.active, status: "done", messages: [] }, { turnId: state.active } as never);
+        expect(await read.toModelOutput!({ toolCallId: "video-read", input: { uri }, output: result })).toMatchObject({
+          type: "json",
+          value: { error: "video_projection_unavailable" },
+        });
+      }
+      expect(model.resolveChatModel.mock.calls.every(([id]) => id === config.chatModel)).toBe(true);
+    } finally {
+      state.active = null;
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["native", "vision", "unavailable"] as const)("shares the %s image preview policy and projection with channel plugins", async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-preview-policy-"));
+    try {
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const agents = new Agents();
+      const setup = vi.fn(async () => null);
+      agents.use({ setup });
+      const model = {
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({
+          model: {} as never,
+          entry: { modalities: { input: ["image"] } },
+          capabilities: { imageToolResult: mode === "native" ? "native" : "unsupported" },
+        })),
+      };
+      const runtimes = new Runtimes(
+        ctx,
+        channels,
+        model as never,
+        {
+          ...config,
+          basePath: root,
+          imageInput: true,
+          visionModel: mode === "vision" ? "vision:model" : "",
+        },
+        agents,
+      );
+      const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+      await runtimes.get(await channels.resolve(scope), { platform: "test", selfId: "bot" } as never);
+      const runtime = (setup.mock.calls[0] as unknown as [unknown, unknown, import("../src/agents/index.js").ChannelPluginSetupContext])[2];
+      expect(runtime.imagePreview?.mode).toBe(mode === "native" ? "native" : "unavailable");
+      expect(runtime.nativeImageInput).toEqual({ mode: mode === "native" ? "native" : "unavailable" });
+      const outcome = runtime.imagePreview!.preview({
+        toolCallId: "preview",
+        turnId: "turn",
+        frames: [{ bytes: PNG_BYTES, mediaType: "image/png", label: "image" }],
+      });
+      expect(outcome.mode).toBe(mode === "native" ? "native" : "unavailable");
+      expect(runtime.imageProjection.getFrames("preview")).toHaveLength(mode === "native" ? 1 : 0);
+      // createAgent is mocked in this suite; explicitly exercise the registered lifecycle hook.
+      const imageLifecycle = vi
+        .mocked(createAgent)
+        .mock.calls.at(-1)?.[0]
+        .plugins?.find((plugin) => plugin.name === "core.image-projection");
+      await imageLifecycle?.stop?.();
+      expect(runtime.imageProjection.getFrames("preview")).toEqual([]);
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { videoInput: false, imageInput: true },
+    { videoInput: true, imageInput: true },
+    { videoInput: true, imageInput: false },
+  ])("projects current attachments and read images without model metadata (video=$videoInput, image=$imageInput)", async ({ videoInput, imageInput }) => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-native-images-"));
+    const ctx = new TestEvents();
+    const modelId = "gemini-4-hydrogen-xhigh";
+    const chatModel = `antigravity-gemini:${modelId}`;
+    const model = new ModelService(ctx as never, { basePath: root, chatModel, videoInput });
+    const channels = new Channels({ basePath: root, imageInput, videoInput });
+    const runtimes = new Runtimes(ctx, channels, model, { ...config, basePath: root, chatModel, imageInput, videoInput }, new Agents());
+    try {
+      await model.start();
+      model.register({
+        id: "antigravity-gemini",
+        capabilities: { chat: true, embedding: false },
+        chatModels: () => [{ id: modelId }],
+        embeddingModels: () => [],
+        chat: () => ({}) as never,
+        chatCapabilities: () => ({ imageToolResult: "native", videoInput: "native" }),
+      });
+      const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+      const channel = await channels.resolve(scope);
+      await runtimes.get(channel, { platform: "test", selfId: "bot" } as never);
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)![0];
+      const assetId = await channel.resources.assets.put(PNG_BYTES);
+      const current = createMessage({ ...message("direct-image", "user", 3), parts: [{ type: "image", asset: assetId }] });
+      const input = agentConfig.plugins!.find((plugin) => plugin.name === "core.model-input")!;
+      const projected = await input.toModelMessages!(current, { history: [], current: [current], live: [current] } as never);
+      const content = (Array.isArray(projected) ? projected[0] : projected)?.content;
+      if (imageInput) {
+        expect(content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "image", mediaType: "image/png", image: PNG_BYTES })]));
+      } else {
+        expect(content).toContain(`[图片：asset://${assetId}]`);
+        expect(typeof content).toBe("string");
+      }
+
+      const read = agentConfig.tools!.find((tool) => tool.name === "read")!;
+      const uri = `asset://${assetId}`;
+      const result = await read.execute({ uri }, { toolCallId: "image-read", turnId: "image-turn", messages: [] } as never);
+      expect(result).toMatchObject({ imageMode: imageInput ? "native" : "unavailable" });
+      const output = await read.toModelOutput!({ toolCallId: "image-read", input: { uri }, output: result });
+      if (imageInput) {
+        expect(output).toMatchObject({
+          type: "content",
+          value: expect.arrayContaining([{ type: "image-data", data: Buffer.from(PNG_BYTES).toString("base64"), mediaType: "image/png" }]),
+        });
+      } else {
+        expect(output).toMatchObject({ type: "json", value: { error: "image_input_unavailable" } });
+      }
+    } finally {
+      await runtimes.stop();
+      await model.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps unsupported image reads unavailable even when a separate vision model is configured", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      vi.mocked(createAgent).mockClear();
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const chat = {
+        fullId: "test:model",
+        providerId: "test",
+        modelId: "model",
+        model: {} as never,
+        entry: { modalities: { input: ["image"] } },
+        capabilities: { imageToolResult: "unsupported" },
+      };
+      const vision = {
+        fullId: "vision:model",
+        providerId: "vision",
+        modelId: "model",
+        model: {} as never,
+        entry: { modalities: { input: ["image"] } },
+      };
+      const model = {
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn((fullId: string) => (fullId === "vision:model" ? vision : chat)),
+      };
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root, visionModel: "vision:model", imageInput: true }, new Agents());
+      const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+      const channel = await channels.resolve(scope);
+      const runtime = await runtimes.get(channel, { platform: "test", selfId: "bot" } as never);
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
+      const tools = (agentConfig?.tools ?? []) as Array<{ name?: string; description?: string }>;
+      const read = tools.find((tool) => tool.name === "read");
+
+      expect(model.resolveChatModel).toHaveBeenNthCalledWith(1, "test:model", scope);
+      expect(model.resolveChatModel).toHaveBeenNthCalledWith(3, "vision:model", scope);
+      expect(tools.map((tool) => tool.name)).not.toContain("describe_image");
+      expect(read?.description).toContain("当前无法查看图片内容");
+      expect(read?.description).not.toContain("自动调用视觉模型");
+      expect(read?.description).not.toContain("图片字节将随结果返回");
+
+      const assetId = await channel.resources.assets.put(PNG_BYTES);
+      const modelInput = (agentConfig?.plugins ?? []).find((plugin) => plugin.name === "core.model-input");
+      const current = createMessage({ ...message("direct-image", "user", 3), parts: [{ type: "image", asset: assetId }] });
+      const projected = await modelInput?.toModelMessages?.(current, { history: [], current: [current], live: [current] } as never);
+      const content = (Array.isArray(projected) ? projected[0] : projected)?.content;
+      expect(content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "image", mediaType: "image/png" })]));
+
+      const missing = createMessage({
+        ...message("missing-image", "user", 4),
+        parts: [{ type: "image", asset: "44444444444444444444444444444444" }],
+      });
+      const failedProjection = await modelInput?.toModelMessages?.(missing, { history: [], current: [missing], live: [missing] } as never);
+      expect(String((Array.isArray(failedProjection) ? failedProjection[0] : failedProjection)?.content)).toContain("[图片：资源不存在]");
+
+      await runtime.stop();
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("does not register describe_image when the configured visionModel lacks image input", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      vi.mocked(createAgent).mockClear();
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn((fullId: string) => ({
+          fullId,
+          providerId: fullId.split(":", 1)[0],
+          modelId: fullId.split(":", 2)[1],
+          model: {} as never,
+          entry: { modalities: { input: ["text"] } },
+        })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root, visionModel: "vision:model", imageInput: false }, new Agents());
+      const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+      const runtime = await runtimes.get(await channels.resolve(scope), { platform: "test", selfId: "bot" } as never);
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
+      const tools = (agentConfig?.tools ?? []) as Array<{ name?: string }>;
+
+      expect(tools.map((tool) => tool.name)).not.toContain("describe_image");
+
+      await runtime.stop();
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("keeps direct runtimes isolated by selfId", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents());
+      const scopeOne = { type: "direct", platform: "test", selfId: "one", userId: "user-1", channelId: "room" } as const;
+      const scopeTwo = { type: "direct", platform: "test", selfId: "two", userId: "user-1", channelId: "room" } as const;
+      const [first, second] = await Promise.all([
+        runtimes.get(await channels.resolve(scopeOne), { platform: "test", selfId: "one" } as never),
+        runtimes.get(await channels.resolve(scopeTwo), { platform: "test", selfId: "two" } as never),
+      ]);
+      expect(first).not.toBe(second);
+      expect(first.context).toEqual(scopeOne);
+      expect(second.context).toEqual(scopeTwo);
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recreates a runtime after reset and rejects new admission after stop", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents());
+      const scope = { type: "guild", platform: "test", channelId: "room", guildId: "room" } as const;
+      const bot = { platform: "test", selfId: "one" };
+      const first = await runtimes.get(await channels.resolve(scope), bot as never);
+      await runtimes.reset(scope);
+      const second = await runtimes.get(await channels.resolve(scope), bot as never);
+      expect(second).not.toBe(first);
+      await runtimes.stop();
+      await expect(runtimes.get(await channels.resolve(scope), bot as never)).rejects.toThrow("stopped");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("keeps different shared channel identities isolated", async () => {
+    const root = await mkdtemp(join(tmpdir(), "yesimbot-runtimes-"));
+    try {
+      const ctx = new TestEvents();
+      const channels = new Channels({ basePath: root });
+      const model = {
+        contextLimit: () => undefined,
+        resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {} })),
+        resolveAuxiliaryModel: vi.fn(() => {
+          throw new Error("auxiliary unavailable");
+        }),
+      };
+      const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents());
+      const one = { type: "guild", platform: "test", channelId: "one", guildId: "one" } as const;
+      const two = { type: "guild", platform: "test", channelId: "two", guildId: "two" } as const;
+      const first = await runtimes.get(await channels.resolve(one), { platform: "test", selfId: "bot" } as never);
+      const second = await runtimes.get(await channels.resolve(two), { platform: "test", selfId: "bot" } as never);
+      expect(first).not.toBe(second);
+      expect(first.context).toEqual(one);
+      expect(second.context).toEqual(two);
+      await runtimes.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agent message protocol enforcement
+// ---------------------------------------------------------------------------
+
+async function protocolRuntime(overrides: Record<string, unknown>) {
+  const root = await mkdtemp(join(tmpdir(), "yesimbot-protocol-"));
+  const ctx = new TestEvents();
+  const channels = new Channels({ basePath: root });
+  const model = {
+    contextLimit: () => undefined,
+    resolveChatModel: vi.fn(() => ({ model: {} as never, entry: {}, ...overrides })),
+    resolveAuxiliaryModel: vi.fn(() => {
+      throw new Error("auxiliary unavailable");
+    }),
+  };
+  const runtimes = new Runtimes(ctx, channels, model as never, { ...config, basePath: root }, new Agents());
+  const channel = await channels.resolve({ type: "guild", platform: "test", channelId: "room", guildId: "room" });
+  await runtimes.get(channel, { platform: "test", selfId: "bot" } as never);
+  return { root, runtimes };
+}
+
+describe("agent message protocol enforcement", () => {
+  beforeEach(() => {
+    state.active = null;
+    vi.mocked(createAgent).mockClear();
+    state.append.mockReset().mockResolvedValue(undefined);
+    state.send.mockReset();
+    state.run.mockReset().mockReturnValue((async function* () {})());
+    state.decide.mockReset().mockResolvedValue("wait");
+    state.decideBatch.mockReset().mockResolvedValue({ decision: "wait" });
+    state.settleReservation.mockReset().mockResolvedValue(undefined);
+    state.observe.mockReset();
+  });
+
+  it("requires a terminal tool and forces the tool choice only for a declared function-calling model", async () => {
+    const { root, runtimes } = await protocolRuntime({ entry: { toolCall: true } });
+    try {
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
+      expect(agentConfig?.requireTerminalTool).toBe(true);
+      expect(agentConfig?.toolChoice).toBe("required");
+    } finally {
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["an unknown capability", {}],
+    ["a disabled capability", { toolCall: false }],
+  ])("requires a terminal tool without forcing for %s", async (_label, entry) => {
+    const { root, runtimes } = await protocolRuntime({ entry });
+    try {
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
+      expect(agentConfig?.requireTerminalTool).toBe(true);
+      expect(agentConfig?.toolChoice).toBeUndefined();
+    } finally {
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not force a tool choice when provider-defined tools are mixed in", async () => {
+    const { root, runtimes } = await protocolRuntime({
+      entry: { toolCall: true },
+      tools: { web_search: { type: "provider", id: "test.web_search", inputSchema: {} } },
+    });
+    try {
+      const agentConfig = vi.mocked(createAgent).mock.calls.at(-1)?.[0];
+      expect(agentConfig?.requireTerminalTool).toBe(true);
+      expect(agentConfig?.toolChoice).toBeUndefined();
+      expect(agentConfig?.providerTools).toBeDefined();
+    } finally {
+      await runtimes.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("exposes a finish tool whose only (optional) field is the private inner thought", async () => {
+    const { value, root } = await runtime();
+    try {
+      const finish = vi
+        .mocked(createAgent)
+        .mock.calls.at(-1)?.[0]
+        .tools?.find((tool) => tool.name === "finish");
+      const schema = (finish?.inputSchema as { jsonSchema?: { properties?: Record<string, unknown>; required?: string[] } } | undefined)?.jsonSchema;
+      expect(finish?.terminal).toBe(true);
+      expect(Object.keys(schema?.properties ?? {}).every((key) => key === "inner_thought")).toBe(true);
+      expect(schema?.required ?? []).toEqual([]);
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a protocol violation, including a delivered marker, as a failed turn that never sends platform text", async () => {
+    state.run.mockReturnValue(
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-protocol" };
+        yield {
+          type: "message.appended",
+          turnId: "turn-protocol",
+          message: { role: "assistant", id: "message-1", content: "[DELIVERED_MESSAGE]\n模型误输出\n[/DELIVERED_MESSAGE]" },
+        };
+        yield {
+          type: "turn.failed",
+          turnId: "turn-protocol",
+          error: { name: "AgentProtocolError", message: "Agent turn ended without a terminal tool call (text-only)" },
+        };
+      })(),
+    );
+    const bot = { selfId: "bot", sendMessage: vi.fn() };
+    const { value, root } = await runtime(undefined, {}, bot);
+    try {
+      const result = await value.post(event);
+      expect(result.kind).toBe("run");
+      if (result.kind === "run") await result.done;
+
+      expect(bot.sendMessage).not.toHaveBeenCalled();
+      expect(state.send).not.toHaveBeenCalled();
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("releases the reservation when a protocol violation ends the turn without delivery", async () => {
+    state.decideBatch.mockResolvedValue({ decision: "trigger", reservationId: "reservation-protocol" });
+    const sendMessage = vi.fn();
+    state.run.mockImplementation(() =>
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-protocol" };
+        yield { type: "message.appended", turnId: "turn-protocol", message: { role: "assistant", id: "message-1", content: "只有文本" } };
+        yield {
+          type: "turn.failed",
+          turnId: "turn-protocol",
+          error: { name: "AgentProtocolError", message: "Agent turn ended without a terminal tool call (text-only)" },
+        };
+      })(),
+    );
+    const will = { decide: state.decide, decideBatch: state.decideBatch, settleReservation: state.settleReservation, observe: state.observe };
+    const { value, root } = await runtime(undefined, {}, { selfId: "bot", sendMessage }, undefined, undefined, will);
+    try {
+      const result = await value.handle(message("message", "user", 1));
+      if (result.kind === "run") await result.done;
+
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(state.settleReservation).toHaveBeenCalledWith("reservation-protocol", { kind: "release", turnId: "turn-protocol", reason: "failed" });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat an empty delivery receipt as platform delivery", async () => {
+    state.decideBatch.mockResolvedValue({ decision: "trigger", reservationId: "reservation-empty" });
+    const sendMessage = vi.fn(async () => []);
+    state.run.mockImplementation(() =>
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-empty" };
+        state.active = "turn-empty";
+        const send = vi
+          .mocked(createAgent)
+          .mock.calls.at(-1)?.[0]
+          .tools?.find((tool) => tool.name === "send_message");
+        await send?.execute?.({ parts: [{ kind: "text", text: "这条没有拿到 messageId" }] }, {
+          toolCallId: "call",
+          turnId: "turn-empty",
+          abortSignal: undefined,
+        } as never);
+        state.active = null;
+        yield { type: "turn.done", turnId: "turn-empty" };
+      })(),
+    );
+    const will = { decide: state.decide, decideBatch: state.decideBatch, settleReservation: state.settleReservation, observe: state.observe };
+    const { value, root } = await runtime(undefined, {}, { selfId: "bot", sendMessage }, undefined, undefined, will);
+    try {
+      const result = await value.handle(message("message", "user", 1));
+      if (result.kind === "run") await result.done;
+
+      expect(sendMessage).toHaveBeenCalledOnce();
+      expect(state.settleReservation).toHaveBeenCalledWith("reservation-empty", { kind: "release", turnId: "turn-empty", reason: "done-without-delivery" });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("commits the reservation only on a real current-channel delivery callback", async () => {
+    state.decideBatch.mockResolvedValue({ decision: "trigger", reservationId: "reservation-delivered" });
+    const sendMessage = vi.fn(async () => ["platform-1"]);
+    state.run.mockImplementation(() =>
+      (async function* () {
+        yield { type: "turn.start", turnId: "turn-delivered" };
+        state.active = "turn-delivered";
+        const send = vi
+          .mocked(createAgent)
+          .mock.calls.at(-1)?.[0]
+          .tools?.find((tool) => tool.name === "send_message");
+        const outcome = await send?.execute?.({ parts: [{ kind: "text", text: "真实送达" }] }, {
+          toolCallId: "call",
+          turnId: "turn-delivered",
+          abortSignal: undefined,
+        } as never);
+        expect(outcome).toMatchObject({ ok: true, messageIds: ["platform-1"] });
+        state.active = null;
+        yield { type: "turn.done", turnId: "turn-delivered" };
+      })(),
+    );
+    const will = { decide: state.decide, decideBatch: state.decideBatch, settleReservation: state.settleReservation, observe: state.observe };
+    const { value, root } = await runtime(undefined, {}, { selfId: "bot", sendMessage }, undefined, undefined, will);
+    try {
+      const result = await value.handle(message("message", "user", 1));
+      if (result.kind === "run") await result.done;
+
+      expect(sendMessage).toHaveBeenCalledWith("room", expect.anything());
+      expect(state.settleReservation).toHaveBeenCalledWith("reservation-delivered", { kind: "commit", turnId: "turn-delivered", messageId: "platform-1" });
+    } finally {
+      await value.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

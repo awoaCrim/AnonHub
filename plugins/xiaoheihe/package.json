@@ -1,0 +1,43 @@
+{
+  "name": "koishi-plugin-yesimbot-xiaoheihe",
+  "version": "0.0.1",
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./extension": {
+      "types": "./dist/extension.d.ts",
+      "require": "./dist/extension.cjs",
+      "default": "./dist/extension.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "pkgroll --sourcemap",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@yesimbot/foundation": "workspace:^",
+    "qrcode": "1.5.4",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.5",
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "vitest": "^4.0.18"
+  },
+  "peerDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^"
+  }
+}

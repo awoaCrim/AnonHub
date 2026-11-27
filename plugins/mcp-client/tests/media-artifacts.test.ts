@@ -1,0 +1,146 @@
+import type { AgentPlugin } from "@yesimbot/agent-runtime";
+import { configureLogging } from "@yesimbot/foundation";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { identity, policy } from "../../../tests/tool-policy.js";
+
+const mocks = vi.hoisted(() => ({
+  connectMcpServer: vi.fn<() => Promise<unknown>>(),
+}));
+
+vi.mock("../src/transports", () => ({ connectMcpServer: mocks.connectMcpServer }));
+
+import { createService } from "./helpers.js";
+
+beforeEach(() => {
+  configureLogging({ sink: () => undefined });
+});
+
+const PNG_BASE64 = "iVBORw0KGgo="; // decodes to a tiny PNG header
+
+function createContext() {
+  const plugins: AgentPlugin[] = [];
+  const disposers: Array<() => void> = [];
+  const artifactPut = vi.fn(async (bytes: Uint8Array, metadata: { mediaType?: string; filename?: string }) => {
+    void bytes;
+    void metadata;
+    return "artifact://tools-listSnapshots/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4";
+  });
+  const artifactForTool = vi.fn(() => ({ put: artifactPut }));
+  const ctx = {
+    yesimbot: {
+      identity,
+      config: {},
+      agent: {
+        use: vi.fn((plugin: AgentPlugin) => {
+          plugins.push(plugin);
+          const dispose = vi.fn();
+          disposers.push(dispose);
+          return dispose;
+        }),
+      },
+      resource: { get: vi.fn(async () => ({ path: "/tmp", assets: {}, artifacts: { forTool: artifactForTool } })) },
+    },
+  };
+  return { ctx, disposers, plugins, artifactForTool, artifactPut };
+}
+
+function createClient(toolNames: string[] = ["listSnapshots"]) {
+  return {
+    callTool: vi.fn(),
+    close: vi.fn(async () => undefined),
+    listTools: vi.fn(async () => ({ tools: toolNames.map((name) => ({ name, description: "take a screenshot", inputSchema: { type: "object" } })) })),
+    setNotificationHandler: vi.fn(),
+  };
+}
+
+async function buildPlugin(serverName = "tools", toolNames: string[] = ["listSnapshots"]) {
+  const { ctx, plugins, artifactForTool, artifactPut } = createContext();
+  const client = createClient(toolNames);
+  mocks.connectMcpServer.mockResolvedValueOnce({ client, transport: { close: vi.fn(async () => undefined) } });
+  const plugin = createService(ctx as never, {
+    mcpServers: { [serverName]: { type: "http", url: "https://example.test/mcp" } },
+  });
+  await plugin.start();
+  const agentPlugin = await plugins[0]!.setup(
+    { type: "direct", platform: "onebot", channelId: "private:owner", userId: "owner", selfId: "bot" } as never,
+    {} as never,
+  );
+  if (!agentPlugin) throw new Error("MCP runtime plugin was not created");
+  return { client, agentPlugin, artifactForTool, artifactPut };
+}
+
+describe("mcp-client media outputs", () => {
+  it("persists supported inline images as artifact references", async () => {
+    const { client, agentPlugin, artifactForTool, artifactPut } = await buildPlugin();
+    client.callTool.mockResolvedValueOnce({ content: [{ type: "image", data: PNG_BASE64, mimeType: "image/png" }] });
+
+    const tool = agentPlugin.tools![0]!;
+    const output = await tool.execute({}, {} as never);
+
+    if (typeof tool.toModelOutput !== "function") throw new Error("toModelOutput unavailable");
+    const modelOutput = await tool.toModelOutput({ output, toolCallId: "call-1" });
+
+    expect(modelOutput).toMatchObject({ type: "text" });
+    const value = (modelOutput as { value: string }).value;
+    expect(value).toContain("artifact://tools-listSnapshots/019d3b7e-1bd0-7e4f-9c5d-5bf3fd41f1d4");
+    expect(value).not.toContain("iVBORw0KGgo");
+    expect(value).not.toContain("base64");
+    expect(artifactForTool).toHaveBeenCalledWith("tools-listSnapshots");
+    const [bytes, metadata] = artifactPut.mock.calls[0]!;
+    expect([...bytes]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    expect(metadata).toEqual({ mediaType: "image/png", filename: "mcp-image" });
+  });
+  it("sanitizes unsafe server and tool names before artifact persistence", async () => {
+    const { client, agentPlugin, artifactForTool } = await buildPlugin("mcp hub", ["search/tool"]);
+    client.callTool.mockResolvedValueOnce({ content: [{ type: "image", data: PNG_BASE64, mimeType: "image/png" }] });
+
+    const tool = agentPlugin.tools![0]!;
+    expect(tool.name).toMatch(/^[a-zA-Z0-9_-]+$/);
+    expect(tool.name).toBe("mcp_hub-search_tool");
+
+    const output = await tool.execute({}, {} as never);
+    if (typeof tool.toModelOutput !== "function") throw new Error("toModelOutput unavailable");
+    await tool.toModelOutput({ output, toolCallId: "call-1" });
+
+    expect(artifactForTool).toHaveBeenCalledWith("mcp_hub-search_tool");
+    expect(client.callTool).toHaveBeenCalledWith({ name: "search/tool", arguments: {} });
+  });
+  it("bounds inline image persistence to Core image limits", async () => {
+    const { client, agentPlugin, artifactPut } = await buildPlugin();
+    const image = { type: "image", data: PNG_BASE64, mimeType: "image/png" };
+    client.callTool.mockResolvedValueOnce({ content: [image, image, image, image, image] });
+
+    const tool = agentPlugin.tools![0]!;
+    const output = await tool.execute({}, {} as never);
+    if (typeof tool.toModelOutput !== "function") throw new Error("toModelOutput unavailable");
+    const modelOutput = await tool.toModelOutput({ output, toolCallId: "call-1" });
+
+    expect(artifactPut).toHaveBeenCalledTimes(4);
+    expect(modelOutput).toMatchObject({ type: "text", value: expect.stringContaining("超出图片限制") });
+  });
+
+  it("returns bounded descriptions for unknown blocks without JSON.stringify", async () => {
+    const { client, agentPlugin } = await buildPlugin();
+    client.callTool.mockResolvedValueOnce({ content: [{ type: "resource", uri: "https://example.test/file.pdf", text: "not readable" }] });
+
+    const tool = agentPlugin.tools![0]!;
+    const output = await tool.execute({}, {} as never);
+    if (typeof tool.toModelOutput !== "function") throw new Error("toModelOutput unavailable");
+    const modelOutput = await tool.toModelOutput({ output, toolCallId: "call-1" });
+
+    const value = (modelOutput as { value: string }).value;
+    expect(value).toContain("不支持的内容块");
+    expect(value).not.toContain("https://example.test");
+  });
+
+  it("keeps remote tool descriptions untouched and adds one prompt block", async () => {
+    const { agentPlugin } = await buildPlugin();
+
+    expect(agentPlugin.tools![0]!.description).toBe("take a screenshot");
+    if (typeof agentPlugin.appendSystemPrompt !== "function") throw new Error("appendSystemPrompt unavailable");
+    const prompt = await agentPlugin.appendSystemPrompt({} as never);
+    expect(String(prompt)).toContain("artifact://");
+    expect(String(prompt)).toContain("read");
+  });
+});

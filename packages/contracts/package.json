@@ -1,0 +1,73 @@
+{
+  "name": "@yesimbot/contracts",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "catalog": [
+        "dist/catalog.d.ts"
+      ],
+      "platforms": [
+        "dist/platforms.d.ts"
+      ],
+      "parts": [
+        "dist/parts.d.ts"
+      ],
+      "role-cards": [
+        "dist/role-cards.d.ts"
+      ]
+    }
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    },
+    "./catalog": {
+      "types": "./dist/catalog.d.ts",
+      "require": "./dist/catalog.cjs",
+      "default": "./dist/catalog.js"
+    },
+    "./platforms": {
+      "types": "./dist/platforms.d.ts",
+      "require": "./dist/platforms.cjs",
+      "default": "./dist/platforms.js"
+    },
+    "./tools": {
+      "types": "./dist/tools.d.ts",
+      "require": "./dist/tools.cjs",
+      "default": "./dist/tools.js"
+    },
+    "./reply-triggers": {
+      "types": "./dist/reply-triggers.d.ts",
+      "import": "./dist/reply-triggers.js",
+      "require": "./dist/reply-triggers.cjs"
+    },
+    "./parts": {
+      "types": "./dist/parts.d.ts",
+      "require": "./dist/parts.cjs",
+      "default": "./dist/parts.js"
+    },
+    "./role-cards": {
+      "types": "./dist/role-cards.d.ts",
+      "require": "./dist/role-cards.cjs",
+      "default": "./dist/role-cards.js"
+    }
+  },
+  "scripts": {
+    "build": "pkgroll --sourcemap=inline",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "name": "koishi-plugin-yesimbot-model-provider",
+  "version": "0.0.1",
+  "description": "Multiple native model-provider connections in one YesImBot configuration",
+  "license": "MIT",
+  "contributors": [
+    "MiaowFISH <miaowfish@qq.com>"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YesWeAreBot/YesImBot.git",
+    "directory": "providers/model-provider"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./extension": {
+      "types": "./dist/extension.d.ts",
+      "require": "./dist/extension.cjs",
+      "default": "./dist/extension.cjs"
+    },
+    "./package.json": "./package.json",
+    "./images": {
+      "types": "./dist/images.d.ts",
+      "import": "./dist/images.js",
+      "require": "./dist/images.cjs"
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "build": "npx pkgroll --sourcemap=inline",
+    "check-types": "tsc --noEmit",
+    "clean": "rimraf .turbo && rimraf dist && rimraf tsconfig.tsbuildinfo",
+    "fmt": "oxfmt",
+    "lint": "oxlint",
+    "pub": "yarn npm publish --access public",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.0",
+    "@ai-sdk/deepseek": "^2.0.0",
+    "@ai-sdk/google": "^3.0.0",
+    "@ai-sdk/openai": "^3.0.0",
+    "@yesimbot/foundation": "workspace:^",
+    "ai": "^6.0.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "vitest": "^4.0.18",
+    "zod": "^3.25.76"
+  },
+  "peerDependencies": {
+    "@yesimbot/agent-runtime": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "zod": "^3.25.76"
+  }
+}

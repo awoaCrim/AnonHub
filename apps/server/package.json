@@ -1,0 +1,60 @@
+{
+  "name": "@yesimbot/server",
+  "version": "0.0.1",
+  "private": true,
+  "bin": {
+    "yesimbot-server": "./dist/main.js"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "pkgroll --sourcemap=inline",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@koa/router": "^10.1.1",
+    "@yesimbot/foundation": "workspace:^",
+    "@yesimbot/onebot": "workspace:^",
+    "koa": "^2.16.4",
+    "koa-body": "^6.0.1",
+    "koishi-plugin-adapter-wechat-bridge": "workspace:^",
+    "koishi-plugin-yesimbot": "workspace:^",
+    "koishi-plugin-yesimbot-console": "workspace:^",
+    "koishi-plugin-yesimbot-device-connection": "workspace:^",
+    "koishi-plugin-yesimbot-google": "workspace:^",
+    "koishi-plugin-yesimbot-image-tools": "workspace:^",
+    "koishi-plugin-yesimbot-mcp-client": "workspace:^",
+    "koishi-plugin-yesimbot-memorizer": "workspace:^",
+    "koishi-plugin-yesimbot-message-debounce": "workspace:^",
+    "koishi-plugin-yesimbot-model-provider": "workspace:^",
+    "koishi-plugin-yesimbot-onebot-utils": "workspace:^",
+    "koishi-plugin-yesimbot-roleplay": "workspace:^",
+    "koishi-plugin-yesimbot-schedule": "workspace:^",
+    "koishi-plugin-yesimbot-search-service": "workspace:^",
+    "koishi-plugin-yesimbot-sticker-manager": "workspace:^",
+    "koishi-plugin-yesimbot-usage": "workspace:^",
+    "koishi-plugin-yesimbot-workspace": "workspace:^",
+    "koishi-plugin-yesimbot-xiaoheihe": "workspace:^",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/koa": "^2.15.0",
+    "@types/koa__router": "^8.0.11",
+    "@types/ws": "^8.18.1",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  }
+}
